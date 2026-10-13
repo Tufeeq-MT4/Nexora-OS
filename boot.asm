@@ -9,13 +9,13 @@ start:
     mov ss, ax
     mov sp, 0x7c00
     sti
-    cld                         ; FIX 5
+    cld
 
-    mov ah, 0x00                ; clear screen
+    mov ah, 0x00
     mov al, 0x03
     int 0x10
 
-    mov ah, 0x01                ; cursor shape
+    mov ah, 0x01
     mov ch, 0x06
     mov cl, 0x07
     int 0x10
@@ -33,9 +33,9 @@ main_loop:
     cmp al, 8
     je .backspace
 
-    cmp al, 32                  ; FIX 3: ignore special/control keys
+    cmp al, 32
     jb main_loop
-    cmp di, buffer + 63         ; FIX 2: buffer full, ignore
+    cmp di, buffer + 63
     jae main_loop
 
     mov ah, 0x0E
@@ -54,17 +54,25 @@ main_loop:
     mov al, 10
     int 0x10
 
-    cmp di, buffer              ; FIX 4: empty line, skip command check
+    cmp di, buffer
     je .skip
     call check_command
 .skip:
     mov si, prompt
     call print_string
+
+    mov di, buffer
+    mov cx, 64
+.clear:
+    mov byte [di], 0
+    inc di
+    loop .clear
+
     mov di, buffer
     jmp main_loop
 
 .backspace:
-    cmp di, buffer              ; FIX 1: check FIRST
+    cmp di, buffer
     je main_loop
     dec di
     mov ah, 0x0E
@@ -104,6 +112,11 @@ check_command:
     call compare
     je .do_about
 
+    mov si, cmd_echo
+    mov di, buffer
+    call compare_cmd
+    je .do_echo
+
     mov si, msg_notfound
     call print_string
     ret
@@ -124,6 +137,20 @@ check_command:
     call print_string
     ret
 
+.do_echo:
+    cmp byte [buffer + 4], 0
+    je .echo_newline
+    mov si, buffer
+    add si, 5
+    call print_string
+.echo_newline:
+    mov ah, 0x0E
+    mov al, 13
+    int 0x10
+    mov al, 10
+    int 0x10
+    ret
+
 compare:
 .loop:
     mov al, [si]
@@ -137,18 +164,44 @@ compare:
     jmp .loop
 .not_equal:
     mov al, 1
-    cmp al, 0                   ; ZF = 0
+    cmp al, 0
     ret
 .equal:
-    xor al, al                  ; ZF = 1
+    xor al, al
+    ret
+
+compare_cmd:
+.loop:
+    mov al, [si]
+    cmp al, 0
+    je .cmd_end
+    cmp al, [di]
+    jne .not_equal
+    inc si
+    inc di
+    jmp .loop
+.cmd_end:
+    mov al, [di]
+    cmp al, 0
+    je .equal
+    cmp al, ' '
+    je .equal
+    jmp .not_equal
+.not_equal:
+    mov al, 1
+    cmp al, 0
+    ret
+.equal:
+    xor al, al
     ret
 
 prompt:       db "Nexora> ", 0
 cmd_help:     db "help", 0
 cmd_clear:    db "clear", 0
 cmd_about:    db "about", 0
+cmd_echo:     db "echo", 0
 
-msg_help:     db "Commands: help, clear, about", 13, 10, 0
+msg_help:     db "Commands: help, clear, about, echo", 13, 10, 0
 msg_about:    db "Nexora OS v0.1 - Made by Nexora CEO", 13, 10, 0
 msg_notfound: db "Command not found!", 13, 10, 0
 
