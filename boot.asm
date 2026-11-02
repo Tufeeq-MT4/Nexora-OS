@@ -1,5 +1,5 @@
-[org 0x7c00]
 [bits 16]
+[org 0x7C00]
 
 start:
     cli
@@ -7,17 +7,21 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x7c00
-    sti
+    mov sp, 0x7C00
 
-    ; Kernel ko load karo (30 sectors)
+    ; Mode 13h on karo (320x200, 256 colors)
+    mov ax, 0x0013
+    int 0x10
+
+    ; Kernel load karo (Sector 2 se 20 sectors)
     mov ah, 0x02
-    mov al, 30
+    mov al, 20
     mov ch, 0
     mov cl, 2
     mov dh, 0
     mov bx, 0x1000
     int 0x13
+    jc disk_error
 
     ; 32-bit mode on karo
     cli
@@ -26,6 +30,12 @@ start:
     or eax, 0x1
     mov cr0, eax
     jmp 0x08:init_pm
+
+disk_error:
+    mov ah, 0x0E
+    mov al, 'E'
+    int 0x10
+    jmp $
 
 [bits 32]
 init_pm:
@@ -36,7 +46,6 @@ init_pm:
     mov gs, ax
     mov ss, ax
     mov esp, 0x90000
-    
     jmp 0x1000
 
 gdt_start:
