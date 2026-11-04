@@ -1,4 +1,3 @@
-
 all:
 	nasm -f bin boot.asm -o boot.bin
 	nasm -f elf32 kernel_entry.asm -o kernel_entry.o
@@ -10,7 +9,8 @@ all:
 	dd if=kernel.bin of=os.img bs=512 seek=1 conv=notrunc
 
 run:
-	qemu-system-i386 -drive format=raw,file=os.img,if=floppy
+	qemu-system-i386 -fda os.img -usb -device usb-mouse
 
 clean:
 	rm -f boot.bin kernel_entry.o kernel.o kernel.elf kernel.bin os.img
+

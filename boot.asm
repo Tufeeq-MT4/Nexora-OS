@@ -9,11 +9,11 @@ start:
     mov ss, ax
     mov sp, 0x7C00
 
-    ; Mode 13h on karo (320x200, 256 colors)
+    ; VGA Mode 13h (320x200) - Sab se reliable mode
     mov ax, 0x0013
     int 0x10
 
-    ; Kernel load karo (Sector 2 se 20 sectors)
+    ; Kernel load karo
     mov ah, 0x02
     mov al, 20
     mov ch, 0
