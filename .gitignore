@@ -2,3 +2,13 @@
 *.img
 *.o
 *.elf
+*.o
+*.elf
+boot.bin
+kernel.bin
+os.img
+nexora.iso
+nexora.img
+nexora_v1/
+nexora_v1.zip
+*.Identifier
