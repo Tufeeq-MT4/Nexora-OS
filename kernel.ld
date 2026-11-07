@@ -5,6 +5,8 @@ SECTIONS {
     .rodata : ALIGN(4) { *(.rodata .rodata.*) }
     .data   : ALIGN(4) { *(.data .data.*) }
     . = ALIGN(4);
+    .tail   : { LONG(0x4E455841) }
+    . = ALIGN(4);
     __bss_start = .;
     .bss    : { *(.bss .bss.*) *(COMMON) }
     . = ALIGN(4);

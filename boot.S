@@ -82,7 +82,7 @@ msg_disk:   .asciz "Nexora: disk read error"
 stage2:
     mov [boot_drive], dl
 
-    # ---------- load the kernel to 0x10000 (32 sectors per BIOS call) ----------
+    # ---------- load the kernel to 0x10000 (small chunks, retries, checked) ----------
     mov dword ptr [cur_lba], 4
     mov word ptr [cur_seg], 0x1000
     mov word ptr [remaining], offset KSECTORS
@@ -90,23 +90,40 @@ load_loop:
     mov ax, [remaining]
     test ax, ax
     jz load_done
-    cmp ax, 32
+    cmp ax, 1
     jbe 1f
-    mov ax, 32
-1:  mov [dap+2], ax
+    mov ax, 1
+1:  mov [chunk], ax
+    mov byte ptr [retries], 3
+read_again:
+    mov ax, [chunk]
+    mov [dap+2], ax
     mov word ptr [dap+4], 0
     mov bx, [cur_seg]
     mov [dap+6], bx
     mov ecx, [cur_lba]
     mov [dap+8], ecx
     mov dword ptr [dap+12], 0
-    push ax
     mov si, offset dap
     mov dl, [boot_drive]
     mov ah, 0x42
     int 0x13
-    jc disk_err
-    pop ax
+    jnc read_ok
+    xor ax, ax                      # reset the disk and try again
+    mov dl, [boot_drive]
+    int 0x13
+    dec byte ptr [retries]
+    jnz read_again
+    jmp read_fail
+read_ok:
+    mov ax, [dap+2]                 # sectors really transferred (some BIOSes update it)
+    test ax, ax
+    jz use_chunk
+    cmp ax, [chunk]
+    jbe have_count
+use_chunk:
+    mov ax, [chunk]
+have_count:
     sub [remaining], ax
     movzx ecx, ax
     add [cur_lba], ecx
@@ -114,6 +131,14 @@ load_loop:
     add [cur_seg], ax
     jmp load_loop
 load_done:
+
+    # ---------- check the kernel was loaded completely (magic dword at its end) ----------
+    mov ax, offset ((0x10000 + KBYTES - 4) >> 4)
+    mov fs, ax
+    mov si, offset ((0x10000 + KBYTES - 4) & 15)
+    mov eax, fs:[si]
+    cmp eax, 0x4E455841
+    jne kernel_bad
 
     # ---------- enable A20 ----------
     mov ax, 0x2401
@@ -281,6 +306,44 @@ vbe_fail:
     call print
     jmp hang
 
+read_fail:
+    mov si, offset msg_disk
+    call print
+    mov si, offset msg_lba
+    call print
+    mov ax, [cur_lba]
+    call print_hex16
+    jmp hang
+
+kernel_bad:
+    mov si, offset msg_bad
+    call print
+    mov si, offset msg_lba
+    call print
+    mov ax, [cur_lba]
+    call print_hex16
+    mov si, offset msg_left
+    call print
+    mov ax, [remaining]
+    call print_hex16
+    jmp hang
+
+print_hex16:                        # print AX as 4 hex digits
+    mov cx, 4
+1:  rol ax, 4
+    push ax
+    and al, 0x0F
+    add al, 0x30
+    cmp al, 0x39
+    jbe 2f
+    add al, 7
+2:  mov ah, 0x0E
+    mov bx, 7
+    int 0x10
+    pop ax
+    loop 1b
+    ret
+
     .code32
 pm_entry:
     mov ax, 0x10
@@ -304,6 +367,8 @@ gdt_desc:
     .long gdt_start
 
 cur_lba:    .long 0
+chunk:      .word 0
+retries:    .byte 0
 cur_seg:    .word 0
 remaining:  .word 0
 list_off:   .word 0
@@ -311,6 +376,9 @@ list_seg:   .word 0
 cur_mode:   .word 0
 best_mode:  .word 0
 best_score: .byte 0
+msg_bad:    .asciz "Nexora: kernel not fully loaded from USB (read error)"
+msg_lba:    .asciz " lba=0x"
+msg_left:   .asciz " left=0x"
 msg_vbe:    .asciz "Nexora: VESA graphics mode not supported on this PC"
 
 #   width, height, rank   (higher rank = preferred)

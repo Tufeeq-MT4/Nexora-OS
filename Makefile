@@ -19,9 +19,9 @@ kernel.bin: kernel.elf
 	objcopy -O binary kernel.elf kernel.bin
 
 boot.bin: boot.S kernel.bin
-	KS=$$(( ($$(stat -c%s kernel.bin) + 511) / 512 )); \
-	echo "kernel sectors: $$KS"; \
-	as --32 --defsym KSECTORS=$$KS boot.S -o boot.o && \
+	SZ=$$(stat -c%s kernel.bin); KS=$$(( (SZ + 511) / 512 )); \
+	echo "kernel bytes: $$SZ  sectors: $$KS"; \
+	as --32 --defsym KSECTORS=$$KS --defsym KBYTES=$$SZ boot.S -o boot.o && \
 	ld -m elf_i386 -Ttext 0x7C00 -e _start -o boot.elf boot.o && \
 	objcopy -O binary boot.elf boot.bin
 
