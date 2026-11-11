@@ -25,6 +25,13 @@ extern const u8 logo_bin[], font0_bin[], font1_bin[], font2_bin[];
 static int  W, H;
 static u32 *BACK, *WALL, *SCR;
 
+/* ---- mouse state (shared) ---- */
+static int mx, my;            /* cursor position            */
+static int mbtn;              /* bit0 left, bit1 right, bit2 middle */
+static int mclick;            /* set to 1 on a new left click        */
+static int mcyc;              /* position inside 3-byte packet       */
+static u8  mpk[3];
+
 #ifdef HOST
   extern void host_init(int *w, int *h);
   extern void host_put_row(int y, int x, const u32 *s, int n);
@@ -46,6 +53,7 @@ static u32 *BACK, *WALL, *SCR;
   static void put_row(int y, int x, const u32 *s, int n) { host_put_row(y, x, s, n); }
   static int  plat_key(void)          { return host_key(); }
   static void plat_wait(u32 ms)       { host_advance(ms); }
+  static void mouse_reset(void)       { }
 #else
   #define SNAP(n) ((void)0)
 
@@ -93,6 +101,57 @@ static u32 *BACK, *WALL, *SCR;
   }
   static void plat_wait(u32 ms) { u32 t = ms_now(); while (ms_now() - t < ms) __asm__ volatile("pause"); }
 
+  /* ---------------- PS/2 mouse (polling, no interrupts needed) ---------------- */
+  static u32 mlast;
+  static void ps2_wait_w(void) { int g = 100000; while ((inb(0x64) & 2) && --g) { } }
+  static int  ps2_wait_r(void) { int g = 100000; while (!(inb(0x64) & 1) && --g) { } return g > 0; }
+  static void ps2_cmd(u8 c)    { ps2_wait_w(); outb(0x64, c); }
+  static void ps2_data(u8 d)   { ps2_wait_w(); outb(0x60, d); }
+  static void mouse_write(u8 v) {
+      ps2_cmd(0xD4); ps2_data(v);
+      if (ps2_wait_r()) inb(0x60);                    /* ACK (0xFA) */
+  }
+  static void mouse_reset(void) {                     /* drop old bytes, restart packet sync */
+      int g = 64;
+      while ((inb(0x64) & 1) && g--) inb(0x60);
+      mcyc = 0; mbtn = 0; mclick = 0;
+  }
+  static void mouse_init(void) {
+      u8 cfg; int i;
+      ps2_cmd(0xA8);                                  /* enable 2nd PS/2 port (mouse) */
+      ps2_cmd(0x20); ps2_wait_r(); cfg = inb(0x60);   /* read controller config */
+      cfg &= (u8)~0x20;                               /* mouse clock ON */
+      ps2_cmd(0x60); ps2_data(cfg);
+      ps2_cmd(0xD4); ps2_data(0xFF);                  /* mouse reset -> FA AA 00 */
+      for (i = 0; i < 3; i++) if (ps2_wait_r()) inb(0x60);
+      mouse_write(0xF6);                              /* defaults */
+      mouse_write(0xF4);                              /* enable data reporting */
+      mx = W / 2; my = H / 2; mouse_reset();
+  }
+  /* called for every byte that comes from the mouse */
+  static void mouse_feed(u8 b) {
+      u32 t = ms_now();
+      if (mcyc && t - mlast > 60) mcyc = 0;           /* lost a byte -> resync */
+      mlast = t;
+      if (mcyc == 0 && !(b & 8)) return;              /* first byte must have bit3 set */
+      mpk[mcyc++] = b;
+      if (mcyc < 3) return;
+      mcyc = 0;
+      if (mpk[0] & 0xC0) return;                      /* overflow -> ignore packet */
+      {
+          int dx = mpk[1], dy = mpk[2], nb = mpk[0] & 7;
+          if (mpk[0] & 0x10) dx -= 256;
+          if (mpk[0] & 0x20) dy -= 256;
+          mx += dx; my -= dy;
+          if (mx < 0) mx = 0;
+          if (my < 0) my = 0;
+          if (mx > W - 1) mx = W - 1;
+          if (my > H - 1) my = H - 1;
+          if ((nb & 1) && !(mbtn & 1)) mclick = 1;
+          mbtn = nb;
+      }
+  }
+
   static void plat_init(void) {
       struct bootinfo *b = (struct bootinfo *)0x5800;
       W = (int)b->width; H = (int)b->height;
@@ -102,6 +161,7 @@ static u32 *BACK, *WALL, *SCR;
       fb_swap = (b->redpos == 0);
       BACK = (u32 *)0x00400000; WALL = (u32 *)0x01000000; SCR = (u32 *)0x02000000;
       time_init();
+      mouse_init();
   }
   static void put_row(int y, int x, const u32 *s, int n) {
       u8 *d = fb_base + (u32)y * fb_pitch + (u32)x * (fb_bpp >> 3);
@@ -123,7 +183,7 @@ static u32 *BACK, *WALL, *SCR;
   static int plat_key(void) {
       u8 st = inb(0x64);
       if (!(st & 1)) return -1;
-      if (st & 0x20) { inb(0x60); return -1; }        /* mouse byte: discard */
+      if (st & 0x20) { mouse_feed(inb(0x60)); return -1; }   /* mouse byte */
       return inb(0x60);
   }
 #endif
@@ -342,6 +402,70 @@ static void restore(int x, int y, int w, int h) {      /* WALL -> BACK region */
     int x1 = x + w, y1 = y + h, j;
     if (x < 0) x = 0; if (y < 0) y = 0; if (x1 > W) x1 = W; if (y1 > H) y1 = H;
     for (j = y; j < y1; j++) memcpy(BACK + j * W + x, WALL + j * W + x, (unsigned)(x1 - x) * 4);
+}
+
+/* ---------------- mouse cursor ---------------- */
+#define CUR_W 12
+#define CUR_H 19
+static const char *CUR[CUR_H] = {
+    "X           ",
+    "XX          ",
+    "X.X         ",
+    "X..X        ",
+    "X...X       ",
+    "X....X      ",
+    "X.....X     ",
+    "X......X    ",
+    "X.......X   ",
+    "X........X  ",
+    "X.....XXXXX ",
+    "X..X..X     ",
+    "X.X X..X    ",
+    "XX  X..X    ",
+    "X    X..X   ",
+    "     X..X   ",
+    "      X..X  ",
+    "      X..X  ",
+    "       XX   "
+};
+static int cur_x, cur_y, cur_on;
+static u32 cbuf[(CUR_W * 2) * (CUR_H * 2)];
+/* draws region (x0,y0,w,h) of BACK to the screen with the cursor on top at (cx,cy) */
+static void cur_blit(int x0, int y0, int w, int h, int cx, int cy) {
+    int i, j;
+    for (j = 0; j < h; j++) {
+        int py = y0 + j, xs = x0 < 0 ? -x0 : 0, xe = (x0 + w > W) ? W - x0 : w;
+        if (py < 0 || py >= H) continue;
+        for (i = xs; i < xe; i++) {
+            int ci = x0 + i - cx, cj = py - cy;
+            u32 c = BACK[py * W + x0 + i];
+            if (ci >= 0 && ci < CUR_W && cj >= 0 && cj < CUR_H) {
+                char k = CUR[cj][ci];
+                if (k == 'X') c = 0x000000; else if (k == '.') c = 0xFFFFFF;
+            }
+            cbuf[j * w + i] = c;
+        }
+        if (xe > xs) put_row(py, x0 + xs, cbuf + j * w + xs, xe - xs);
+    }
+}
+static void cursor_draw(void) {                     /* (re)draw cursor at current mouse position */
+    cur_blit(mx, my, CUR_W, CUR_H, mx, my);
+    cur_x = mx; cur_y = my; cur_on = 1;
+}
+static void cursor_update(void) {                   /* call after the mouse moved */
+    int dx = mx - cur_x, dy = my - cur_y;
+    if (!cur_on) { cursor_draw(); return; }
+    if (!dx && !dy) return;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    if (dx < CUR_W && dy < CUR_H) {                 /* close: one combined redraw, no flicker */
+        int x0 = cur_x < mx ? cur_x : mx, y0 = cur_y < my ? cur_y : my;
+        cur_blit(x0, y0, CUR_W + dx, CUR_H + dy, mx, my);
+        cur_x = mx; cur_y = my;
+    } else {                                        /* far: erase old, draw new */
+        cur_blit(cur_x, cur_y, CUR_W, CUR_H, -1000, -1000);
+        cursor_draw();
+    }
 }
 
 /* ======================================================================
@@ -769,6 +893,47 @@ static void compose_desktop(void) {
         text_c(F_UI, icx, dy + 112, LAB[i], 0xFFFFFF, 225);
     }
 }
+static int open_app = -1;
+static const char *APP_NAME[5] = { "Files", "Web", "Terminal", "Settings", "About" };
+static void app_rect(int *x, int *y, int *w, int *h) { *w = 600; *h = 420; *x = (W - *w) / 2 + 120; *y = 170; }
+static void draw_app_window(int i) {
+    int x, y, w, h; char t[40];
+    app_rect(&x, &y, &w, &h);
+    glass(x, y, w, h, 22);
+    fill_rect(x + 14, y + 47, w - 28, 1, 0xFFFFFF, 50);
+    disc(x + 30, y + 24, 8, 0, 0xFF5F57, 0xFF5F57, 256);          /* click = close */
+    disc(x + 56, y + 24, 8, 0, 0xFEBC2E, 0xFEBC2E, 256);
+    disc(x + 82, y + 24, 8, 0, 0x28C840, 0x28C840, 256);
+    text_c(F_UI, x + w / 2, y + 31, APP_NAME[i], 0xFFFFFF, 230);
+    t[0] = 0; scat(t, APP_NAME[i]);
+    text_c(F_BIG, x + w / 2, y + h / 2, t, 0xFFFFFF, 256);
+    text_c(F_UI, x + w / 2, y + h / 2 + 50, "This app is coming soon", 0xC9CED8, 230);
+}
+/* returns dock icon index under (px,py), or -1 */
+static int dock_hit(int px, int py) {
+    int i, dockw = 5 * 118 + 40, dx = (W - dockw) / 2, dy = H - 170;
+    for (i = 0; i < 5; i++) {
+        int icx = dx + 20 + 59 + i * 118, icy = dy + 50;
+        int ax = px - icx, ay = py - icy;
+        if (ax * ax + ay * ay <= 38 * 38) return i;
+    }
+    return -1;
+}
+static void desktop_click(int px, int py) {
+    int x, y, w, h, hit;
+    if (open_app >= 0) {
+        int cx, cy;
+        app_rect(&x, &y, &w, &h); cx = px - (x + 30); cy = py - (y + 24);
+        if (cx * cx + cy * cy <= 12 * 12) {                        /* red button: close */
+            open_app = -1; compose_desktop(); present(0, 0, W, H); cursor_draw(); return;
+        }
+    }
+    hit = dock_hit(px, py);
+    if (hit >= 0) {
+        open_app = hit; compose_desktop(); draw_app_window(hit);
+        present(0, 0, W, H); cursor_draw();
+    }
+}
 static void desktop_screen(void) {
     u32 tc = 0; int lastm = -1, shots = 0; u32 t0;
     memcpy(SCR, BACK, (unsigned)W * H * 4);
@@ -776,16 +941,20 @@ static void desktop_screen(void) {
     crossfade(700);
     t0 = ms_now();
     kb_shift = 0; kb_ext = 0;
+    open_app = -1; cur_on = 0; mouse_reset();
+    cursor_draw();
     for (;;) {
         int c = key_char();
         if (c == 'l' || c == 'L') return;                   /* lock again */
+        if (mx != cur_x || my != cur_y) cursor_update();
+        if (mclick) { mclick = 0; desktop_click(mx, my); }
         if (ms_now() - tc > 400) {
             struct tm_ t; tc = ms_now(); rtc_time(&t);
-            if (lastm >= 0 && t.m != lastm) { redraw_clock(); redraw_tray(); }
+            if (lastm >= 0 && t.m != lastm) { redraw_clock(); redraw_tray(); cursor_draw(); }
             lastm = t.m;
         }
         if (!shots && ms_now() - t0 > 800) { SNAP("08_desktop"); shots = 1; }
-        plat_wait(10);
+        plat_wait(1);                                       /* 1 ms: fast enough for mouse packets */
     }
 }
 
