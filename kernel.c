@@ -15,7 +15,7 @@ typedef int            s32;
 #define NEXORA_PASSWORD  "11223344"
 #define USER_NAME        "Nexora User"
 #define TZ_OFFSET_MIN    0          /* e.g. Pakistan = +300 if the PC clock is in UTC */
-#define TEAL_COLOR       0x008B8B   /* dark cyan */
+#define TEAL_COLOR       0x00363D   /* aqua dark */
 
 /* ======================================================================
  *  PLATFORM LAYER  (real hardware  /  host simulator for testing)
@@ -23,7 +23,24 @@ typedef int            s32;
 extern const u8 logo_bin[], font0_bin[], font1_bin[], font2_bin[];
 
 static int  W, H;
-static u32 *BACK, *WALL, *SCR;
+static u32 *BACK, *WALL, *SCR, *WALL_D, *WALL_N;   /* WALL = wallpaper in use, _D desert, _N night city */
+static u32 gl_fill = 118, gl_edge = 54;            /* glass transparency (lower = more transparent) */
+static int wp_choice;                              /* 0 night, 1 desert, 2.. photo wallpapers */
+static int nwp;                                    /* photo wallpapers found on the disk (walls.bin) */
+static u32 *WALL_P, *THUMBS;                       /* WALL_P = photo wallpaper, THUMBS = settings previews */
+static int pf_ok, pf_vis;                          /* hardware page flip (QEMU std VGA) */
+static u32 *TMP;                                   /* off-screen buffer for smooth transitions */
+static int glass_lvl = 2, show_w = 1, clock24;      /* taskbar controls */
+static const u8 GLA[5] = { 90, 120, 150, 190, 225 };  /* glass opacity levels */
+static int cur_level = 2;                          /* cursor size 0..4 (Settings) */
+static int accent, anim_lvl = 2, accel_on = 1, set_tab, set_edit, edn, save_state;
+static const char *set_msg = "";
+static char uname[24] = "Nexora User", upass[24] = "11223344", edbuf[24];
+static const u32 ACC1[6] = { 0x2FD8D0, 0x4C8DFF, 0xA970FF, 0xFF5FA2, 0x5BE08A, 0xFFA23A };   /* accent colours */
+static const u32 ACC2[6] = { 0x4FE3DC, 0x7FB0FF, 0xC9A4FF, 0xFF9CC6, 0x8CF0B0, 0xFFC46B };   /* matching glass edges */
+static const u8  ANM[4]  = { 0, 60, 100, 160 };                                             /* animation speed: off / fast / normal / slow (%) */
+static int mspeed = 2;                             /* mouse speed level 0..4 */
+static const u8 MSP[5] = { 2, 3, 4, 6, 8 };        /* speed multiplier x2: 1x 1.5x 2x 3x 4x */
 
 /* ---- mouse state (shared) ---- */
 static int mx, my;            /* cursor position            */
@@ -46,19 +63,37 @@ static u8  mpk[3];
   static void plat_init(void) {
       host_init(&W, &H);
       BACK = (u32 *)__builtin_malloc((unsigned)W * H * 4);
-      WALL = (u32 *)__builtin_malloc((unsigned)W * H * 4);
+      WALL_D = (u32 *)__builtin_malloc((unsigned)W * H * 4);
+      WALL_N = (u32 *)__builtin_malloc((unsigned)W * H * 4);
       SCR  = (u32 *)__builtin_malloc((unsigned)W * H * 4);
+      TMP = (u32 *)__builtin_malloc((unsigned)W * H * 4);
+      WALL_P = (u32 *)__builtin_malloc((unsigned)W * H * 4);
+      THUMBS = (u32 *)__builtin_malloc(9 * 128 * 72 * 4);
+      WALL = WALL_D; mx = W / 2; my = H / 2;
   }
   static u32  ms_now(void)            { return host_ms(); }
   static void put_row(int y, int x, const u32 *s, int n) { host_put_row(y, x, s, n); }
-  static int  plat_key(void)          { return host_key(); }
+  extern int host_mouse(int *x, int *y, int *b);
+  static int  plat_key(void) {
+      int x, y, b;
+      if (host_mouse(&x, &y, &b)) { mx = x; my = y; if ((b & 1) && !(mbtn & 1)) mclick = 1; mbtn = b; }
+      return host_key();
+  }
   static void plat_wait(u32 ms)       { host_advance(ms); }
   static void mouse_reset(void)       { }
+  static void mouse_drain(void)       { }
+  extern int host_ata(unsigned lba, unsigned n, unsigned char *dst);
+  static int  ata_read(u32 lba, u32 n, u8 *dst) { return host_ata(lba, n, dst); }
+  extern int host_ata_write(unsigned lba, const unsigned char *src);
+  static int  ata_write(u32 lba, const u8 *src) { return host_ata_write(lba, src); }
+  static void plat_blit_page(const u32 *s, int p) { (void)s; (void)p; }
+  static void plat_flip(int p)        { (void)p; }
+  static u32 *plat_page(int p)        { (void)p; return 0; }
 #else
   #define SNAP(n) ((void)0)
 
   struct bootinfo { u32 fb, pitch, width, height, bpp, redpos; };
-  static u8 *fb_base;
+  static u8 *fb_base, *fb_wr;                         /* fb_wr = page that put_row() writes to */
   static u32 fb_pitch, fb_bpp, fb_swap;
   static u32 cyc_per_ms, tsc_lo0, tsc_hi0;
 
@@ -102,7 +137,6 @@ static u8  mpk[3];
   static void plat_wait(u32 ms) { u32 t = ms_now(); while (ms_now() - t < ms) __asm__ volatile("pause"); }
 
   /* ---------------- PS/2 mouse (polling, no interrupts needed) ---------------- */
-  static u32 mlast;
   static void ps2_wait_w(void) { int g = 100000; while ((inb(0x64) & 2) && --g) { } }
   static int  ps2_wait_r(void) { int g = 100000; while (!(inb(0x64) & 1) && --g) { } return g > 0; }
   static void ps2_cmd(u8 c)    { ps2_wait_w(); outb(0x64, c); }
@@ -111,10 +145,11 @@ static u8  mpk[3];
       ps2_cmd(0xD4); ps2_data(v);
       if (ps2_wait_r()) inb(0x60);                    /* ACK (0xFA) */
   }
+  static int mrx, mry;                                /* sub-pixel remainders (smooth 1.5x speed) */
   static void mouse_reset(void) {                     /* drop old bytes, restart packet sync */
-      int g = 64;
+      int g = 600;
       while ((inb(0x64) & 1) && g--) inb(0x60);
-      mcyc = 0; mbtn = 0; mclick = 0;
+      mcyc = 0; mbtn = 0; mclick = 0; mrx = mry = 0;
   }
   static void mouse_init(void) {
       u8 cfg; int i;
@@ -125,15 +160,13 @@ static u8  mpk[3];
       ps2_cmd(0xD4); ps2_data(0xFF);                  /* mouse reset -> FA AA 00 */
       for (i = 0; i < 3; i++) if (ps2_wait_r()) inb(0x60);
       mouse_write(0xF6);                              /* defaults */
+      mouse_write(0xF3); mouse_write(200);            /* 200 reports per second = smoother */
       mouse_write(0xF4);                              /* enable data reporting */
       mx = W / 2; my = H / 2; mouse_reset();
   }
   /* called for every byte that comes from the mouse */
   static void mouse_feed(u8 b) {
-      u32 t = ms_now();
-      if (mcyc && t - mlast > 60) mcyc = 0;           /* lost a byte -> resync */
-      mlast = t;
-      if (mcyc == 0 && !(b & 8)) return;              /* first byte must have bit3 set */
+      if (mcyc == 0 && !(b & 8)) return;              /* first byte must have bit3 set (sync) */              /* first byte must have bit3 set */
       mpk[mcyc++] = b;
       if (mcyc < 3) return;
       mcyc = 0;
@@ -142,7 +175,13 @@ static u8  mpk[3];
           int dx = mpk[1], dy = mpk[2], nb = mpk[0] & 7;
           if (mpk[0] & 0x10) dx -= 256;
           if (mpk[0] & 0x20) dy -= 256;
-          mx += dx; my -= dy;
+          {   /* speed setting + acceleration curve (like macOS / MateBook) */
+              int sp = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy), g = 8 + (sp > 3 ? (sp - 3) * 2 : 0);
+              if (g > 16) g = 16;
+              if (!accel_on) g = 8;
+              mrx += dx * MSP[mspeed] * g; mry += dy * MSP[mspeed] * g;
+          }
+          mx += mrx / 16; my -= mry / 16; mrx %= 16; mry %= 16;
           if (mx < 0) mx = 0;
           if (my < 0) my = 0;
           if (mx > W - 1) mx = W - 1;
@@ -152,19 +191,88 @@ static u8  mpk[3];
       }
   }
 
+  /* read EVERY waiting mouse byte at once (the 3-byte packets used to pile up while the screen was redrawing) */
+  static void mouse_drain(void) {
+      int g = 200;
+      while (g--) { u8 st = inb(0x64); if (!(st & 1) || !(st & 0x20)) break; mouse_feed(inb(0x60)); }
+  }
+
+  /* ---- hardware double buffering (Bochs/QEMU VBE): two pages, flip = tear-free ---- */
+  static inline void outw(u16 p, u16 v) { __asm__ volatile("outw %0,%1" : : "a"(v), "Nd"(p)); }
+  static inline u16  inw(u16 p)         { u16 v; __asm__ volatile("inw %1,%0" : "=a"(v) : "Nd"(p)); return v; }
+  static void dispi_w(u16 i, u16 v) { outw(0x1CE, i); outw(0x1CF, v); }
+  static u16  dispi_r(u16 i)        { outw(0x1CE, i); return inw(0x1CF); }
+  static void pf_init(void) {
+      u16 id = dispi_r(0);
+      pf_ok = 0; pf_vis = 0;
+      if (id >= 0xB0C4 && id <= 0xB0CF && dispi_r(7) >= (u16)(2 * H) && dispi_r(6) == (u16)W && fb_bpp == 32 && fb_pitch == (u32)W * 4) {
+          dispi_w(9, 0); pf_ok = 1;                      /* page 0 visible */
+      }
+  }
+  static void put_row(int y, int x, const u32 *s, int n);
+  static void plat_blit_page(const u32 *src, int page) {
+      u8 *sv = fb_wr; int y;
+      fb_wr = fb_base + (u32)page * (u32)H * fb_pitch;
+      for (y = 0; y < H; y++) put_row(y, 0, src + (u32)y * (u32)W, W);
+      fb_wr = sv;
+  }
+  static void plat_flip(int page) { dispi_w(9, page ? (u16)H : 0); pf_vis = page; }
+  static u32 *plat_page(int page) { return (fb_bpp == 32 && !fb_swap) ? (u32 *)(fb_base + (u32)page * (u32)H * fb_pitch) : 0; }
+
+  /* ---- ATA PIO (primary master) : used to read the wallpaper pack from the disk image ---- */
+  static int ata_read(u32 lba, u32 n, u8 *dst) {
+      while (n) {
+          u32 c = n > 128 ? 128 : n, k; int g;
+          g = 1000000; while ((inb(0x1F7) & 0x80) && --g) { }
+          if (!g || inb(0x1F7) == 0xFF) return -1;
+          outb(0x1F6, (u8)(0xE0 | ((lba >> 24) & 0x0F)));
+          outb(0x1F2, (u8)c); outb(0x1F3, (u8)lba); outb(0x1F4, (u8)(lba >> 8)); outb(0x1F5, (u8)(lba >> 16));
+          outb(0x1F7, 0x20);
+          for (k = 0; k < c; k++) {
+              u32 words = 256;
+              inb(0x3F6); inb(0x3F6); inb(0x3F6); inb(0x3F6);
+              g = 1000000; while ((inb(0x1F7) & 0x80) && --g) { }
+              if (!g) return -1;
+              if (inb(0x1F7) & 0x21) return -1;
+              if (!(inb(0x1F7) & 0x08)) return -1;
+              __asm__ volatile("rep insw" : "+D"(dst), "+c"(words) : "d"((u16)0x1F0) : "memory");
+          }
+          n -= c; lba += c;
+      }
+      return 0;
+  }
+
+  static int ata_write(u32 lba, const u8 *src) {      /* one sector, used to save the settings */
+      u32 words = 256; int g;
+      g = 1000000; while ((inb(0x1F7) & 0x80) && --g) { }
+      if (!g || inb(0x1F7) == 0xFF) return -1;
+      outb(0x1F6, (u8)(0xE0 | ((lba >> 24) & 0x0F)));
+      outb(0x1F2, 1); outb(0x1F3, (u8)lba); outb(0x1F4, (u8)(lba >> 8)); outb(0x1F5, (u8)(lba >> 16));
+      outb(0x1F7, 0x30);
+      inb(0x3F6); inb(0x3F6); inb(0x3F6); inb(0x3F6);
+      g = 1000000; while ((inb(0x1F7) & 0x80) && --g) { }
+      if (!g || !(inb(0x1F7) & 0x08)) return -1;
+      __asm__ volatile("rep outsw" : "+S"(src), "+c"(words) : "d"((u16)0x1F0) : "memory");
+      g = 1000000; while ((inb(0x1F7) & 0x80) && --g) { }
+      outb(0x1F7, 0xE7);                              /* flush cache */
+      g = 1000000; while ((inb(0x1F7) & 0x80) && --g) { }
+      return (inb(0x1F7) & 0x21) ? -1 : 0;
+  }
+
   static void plat_init(void) {
       struct bootinfo *b = (struct bootinfo *)0x5800;
       W = (int)b->width; H = (int)b->height;
-      fb_base = (u8 *)b->fb; fb_bpp = b->bpp; fb_pitch = b->pitch;
+      fb_base = (u8 *)b->fb; fb_wr = fb_base; fb_bpp = b->bpp; fb_pitch = b->pitch;
       if (fb_bpp != 24) fb_bpp = 32;
       if (fb_pitch < (u32)W * (fb_bpp >> 3)) fb_pitch = (u32)W * (fb_bpp >> 3);
       fb_swap = (b->redpos == 0);
-      BACK = (u32 *)0x00400000; WALL = (u32 *)0x01000000; SCR = (u32 *)0x02000000;
+      BACK = (u32 *)0x00400000; WALL_D = (u32 *)0x01000000; SCR = (u32 *)0x02000000; WALL_N = (u32 *)0x03000000; TMP = (u32 *)0x04000000; WALL_P = (u32 *)0x05000000; THUMBS = (u32 *)0x06000000; WALL = WALL_D;
       time_init();
       mouse_init();
+      pf_init();
   }
   static void put_row(int y, int x, const u32 *s, int n) {
-      u8 *d = fb_base + (u32)y * fb_pitch + (u32)x * (fb_bpp >> 3);
+      u8 *d = fb_wr + (u32)y * fb_pitch + (u32)x * (fb_bpp >> 3);
       int i;
       if (fb_bpp == 32 && !fb_swap) {
           __asm__ volatile("rep movsl" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
@@ -370,33 +478,76 @@ static void draw_logo(int x, int y, int dw, int dh, u32 a) {
 }
 
 /* ---------------- present (copy BACK -> screen) ---------------- */
-static u32 rowbuf[2600];
 static void present(int x, int y, int w, int h) {
     int x1 = x + w, y1 = y + h, r;
     if (x < 0) x = 0; if (y < 0) y = 0; if (x1 > W) x1 = W; if (y1 > H) y1 = H;
     if (x1 <= x || y1 <= y) return;
     for (r = y; r < y1; r++) put_row(r, x, BACK + r * W + x, x1 - x);
 }
-static void present_mix(const u32 *a, const u32 *b, u32 t) {
-    int x, y;
-    for (y = 0; y < H; y++) {
-        const u32 *pa = a + y * W, *pb = b + y * W;
-        for (x = 0; x < W; x++) rowbuf[x] = mix(pa[x], pb[x], t);
-        put_row(y, 0, rowbuf, W);
-    }
-}
 static void frame_wait(u32 t0, u32 min_ms) {
     u32 e = ms_now() - t0;
     if (e < min_ms) plat_wait(min_ms - e);
 }
-static void crossfade(u32 ms) {                        /* SCR (old) -> BACK (new) */
-    u32 t0 = ms_now(), e;
-    while ((e = ms_now() - t0) < ms) {
-        u32 f0 = ms_now();
-        present_mix(SCR, BACK, e * 256 / ms);
+static void show_tmp(void) {                         /* TMP -> screen (hidden page + flip when available) */
+    int y;
+    if (pf_ok) { int tgt = 1 - pf_vis; plat_blit_page(TMP, tgt); plat_flip(tgt); }
+    else for (y = 0; y < H; y++) put_row(y, 0, TMP + (u32)y * (u32)W, W);
+}
+static void present_dip(const u32 *a, u32 t) {       /* picture `a` darkened by t/256 (256 = fully blank) */
+    u32 i, n = (u32)W * (u32)H, k = 256 - t, *dst = TMP, *pg = pf_ok ? plat_page(1 - pf_vis) : 0;
+    if (pg) dst = pg;                                /* write straight into the hidden video page */
+    for (i = 0; i < n; i++) { u32 p = a[i]; dst[i] = ((((p & 0xFF00FF) * k) >> 8) & 0xFF00FF) | ((((p & 0x00FF00) * k) >> 8) & 0x00FF00); }
+    if (pg) plat_flip(1 - pf_vis); else show_tmp();
+}
+static void crossfade_dip(u32 ms) {                  /* SCR (old) -> blank screen -> BACK (new), used for the first boot step */
+    u32 t0 = ms_now(), e, ma = ms * 40 / 100, mb = ms - ma;
+    while ((e = ms_now() - t0) < ma) {               /* 1) old screen fades to blank */
+        u32 f0 = ms_now(), t = e * 256 / ma;
+        t = (t * t) >> 8;
+        present_dip(SCR, t);
         frame_wait(f0, 16);
     }
-    present(0, 0, W, H);
+    present_dip(SCR, 256); plat_wait(70);            /* 2) a moment of blank screen */
+    t0 = ms_now();
+    while ((e = ms_now() - t0) < mb) {               /* 3) new screen opens out of the blank */
+        u32 f0 = ms_now(), u = 256 - e * 256 / mb;
+        u = (u * u) >> 8;
+        present_dip(BACK, u);
+        frame_wait(f0, 16);
+    }
+    if (pf_ok) {                                     /* final frame: show it, and end on page 0 */
+        int tgt = 1 - pf_vis;
+        plat_blit_page(BACK, tgt); plat_flip(tgt);
+        if (pf_vis) { plat_blit_page(BACK, 0); plat_flip(0); }
+    } else present(0, 0, W, H);
+}
+static void present_mix(const u32 *a, const u32 *b, u32 t) {   /* a -> b, t/256, straight into the hidden page */
+    u32 i, n = (u32)W * (u32)H, ia = 256 - t, *dst = TMP, *pg = pf_ok ? plat_page(1 - pf_vis) : 0;
+    if (pg) dst = pg;
+    for (i = 0; i < n; i++) {
+        u32 pa = a[i], pb = b[i];
+        dst[i] = (pa == pb) ? pa : (((((pa & 0xFF00FF) * ia + (pb & 0xFF00FF) * t) >> 8) & 0xFF00FF) | ((((pa & 0x00FF00) * ia + (pb & 0x00FF00) * t) >> 8) & 0x00FF00));
+    }
+    if (pg) plat_flip(1 - pf_vis); else show_tmp();
+}
+static void finish_on_page0(void) {                  /* show BACK for good and end on page 0 */
+    if (pf_ok) {
+        int tgt = 1 - pf_vis;
+        plat_blit_page(BACK, tgt); plat_flip(tgt);
+        if (pf_vis) { plat_blit_page(BACK, 0); plat_flip(0); }
+    } else present(0, 0, W, H);
+}
+static void crossfade(u32 ms) {                      /* smooth dissolve SCR -> BACK (wallpaper stays, items melt into each other) */
+    u32 t0 = ms_now(), e;
+    ms = ms * ANM[anim_lvl] / 100;
+    if (!ms) { finish_on_page0(); return; }
+    while ((e = ms_now() - t0) < ms) {
+        u32 f0 = ms_now(), t = e * 256 / ms;
+        t = (t * t * (768 - 2 * t)) >> 16;               /* smoothstep: soft start, soft end */
+        present_mix(SCR, BACK, t);
+        frame_wait(f0, 8);
+    }
+    finish_on_page0();
 }
 static void restore(int x, int y, int w, int h) {      /* WALL -> BACK region */
     int x1 = x + w, y1 = y + h, j;
@@ -405,34 +556,53 @@ static void restore(int x, int y, int w, int h) {      /* WALL -> BACK region */
 }
 
 /* ---------------- mouse cursor ---------------- */
-#define CUR_W 12
-#define CUR_H 19
-static const char *CUR[CUR_H] = {
-    "X           ",
-    "XX          ",
-    "X.X         ",
-    "X..X        ",
-    "X...X       ",
-    "X....X      ",
-    "X.....X     ",
-    "X......X    ",
-    "X.......X   ",
-    "X........X  ",
-    "X.....XXXXX ",
-    "X..X..X     ",
-    "X.X X..X    ",
-    "XX  X..X    ",
-    "X    X..X   ",
-    "     X..X   ",
-    "      X..X  ",
-    "      X..X  ",
-    "       XX   "
-};
-static int cur_x, cur_y, cur_on;
+#define CUR_W 44
+#define CUR_H 60
+static const short CPX[7] = { 0, 0, 42, 69, 94, 68, 120 };          /* arrow outline, tenths of a pixel at 100% size */
+static const short CPY[7] = { 0, 170, 133, 195, 184, 124, 123 };
+static const short CSC[5] = { 120, 150, 180, 230, 300 };            /* size levels in percent */
+static u16 cur_a[CUR_W * CUR_H];                    /* alpha 0..256 (outline + fill) */
+static u8  cur_g[CUR_W * CUR_H];                    /* grey: 255 = white fill, 0 = black outline */
+static int cur_ready, cur_x, cur_y, cur_on;
 static u32 cbuf[(CUR_W * 2) * (CUR_H * 2)];
-/* draws region (x0,y0,w,h) of BACK to the screen with the cursor on top at (cx,cy) */
+static int in_poly(int px, int py) {                /* even-odd test, coordinates in tenths of a pixel */
+    int i, j = 6, c = 0;
+    for (i = 0; i < 7; i++) {
+        int sc = CSC[cur_level], xi = CPX[i] * sc / 100 + 10, yi = CPY[i] * sc / 100 + 10, xj = CPX[j] * sc / 100 + 10, yj = CPY[j] * sc / 100 + 10;
+        if ((yi > py) != (yj > py)) {
+            int xint = xi + (py - yi) * (xj - xi) / (yj - yi);
+            if (px < xint) c ^= 1;
+        }
+        j = i;
+    }
+    return c;
+}
+static void cursor_build(void) {                    /* smooth arrow with a thin dark outline */
+    static u16 fa[CUR_W * CUR_H];
+    int x, y, sx, sy, k;
+    for (y = 0; y < CUR_H; y++)
+        for (x = 0; x < CUR_W; x++) {
+            int n = 0;
+            for (sy = 0; sy < 4; sy++) for (sx = 0; sx < 4; sx++) n += in_poly(x * 10 + sx * 10 / 4 + 1, y * 10 + sy * 10 / 4 + 1);
+            fa[y * CUR_W + x] = (u16)(n * 16);
+        }
+    for (y = 0; y < CUR_H; y++)
+        for (x = 0; x < CUR_W; x++) {
+            u32 o = 0, a = fa[y * CUR_W + x]; int dx, dy;
+            for (dy = -1; dy <= 1; dy++) for (dx = -1; dx <= 1; dx++) {
+                int xx = x + dx, yy = y + dy;
+                if (xx >= 0 && xx < CUR_W && yy >= 0 && yy < CUR_H && fa[yy * CUR_W + xx] > o) o = fa[yy * CUR_W + xx];
+            }
+            k = y * CUR_W + x;
+            cur_a[k] = (u16)o;
+            cur_g[k] = o ? (u8)(a * 255 / o) : 0;
+        }
+    cur_ready = 1;
+}
+/* draws region (x0,y0,w,h) of BACK to the screen with the cursor sprite on top at (cx,cy) */
 static void cur_blit(int x0, int y0, int w, int h, int cx, int cy) {
     int i, j;
+    if (!cur_ready) cursor_build();
     for (j = 0; j < h; j++) {
         int py = y0 + j, xs = x0 < 0 ? -x0 : 0, xe = (x0 + w > W) ? W - x0 : w;
         if (py < 0 || py >= H) continue;
@@ -440,17 +610,22 @@ static void cur_blit(int x0, int y0, int w, int h, int cx, int cy) {
             int ci = x0 + i - cx, cj = py - cy;
             u32 c = BACK[py * W + x0 + i];
             if (ci >= 0 && ci < CUR_W && cj >= 0 && cj < CUR_H) {
-                char k = CUR[cj][ci];
-                if (k == 'X') c = 0x000000; else if (k == '.') c = 0xFFFFFF;
+                u32 a = cur_a[cj * CUR_W + ci];
+                if (a) { u32 g = cur_g[cj * CUR_W + ci]; c = mix(c, g * 0x010101u, a > 256 ? 256 : a); }
             }
             cbuf[j * w + i] = c;
         }
         if (xe > xs) put_row(py, x0 + xs, cbuf + j * w + xs, xe - xs);
     }
 }
-static void cursor_draw(void) {                     /* (re)draw cursor at current mouse position */
-    cur_blit(mx, my, CUR_W, CUR_H, mx, my);
+static void cursor_draw(void) {                     /* (re)draw cursor at current mouse position (tip = mx,my) */
+    cur_blit(mx - 1, my - 1, CUR_W, CUR_H, mx - 1, my - 1);
     cur_x = mx; cur_y = my; cur_on = 1;
+}
+static void cursor_resize(void) {                   /* change the pointer size on the fly */
+    cur_blit(cur_x - 1, cur_y - 1, CUR_W, CUR_H, -1000, -1000);    /* erase the old pointer */
+    cursor_build();
+    cursor_draw();
 }
 static void cursor_update(void) {                   /* call after the mouse moved */
     int dx = mx - cur_x, dy = my - cur_y;
@@ -459,11 +634,11 @@ static void cursor_update(void) {                   /* call after the mouse move
     if (dx < 0) dx = -dx;
     if (dy < 0) dy = -dy;
     if (dx < CUR_W && dy < CUR_H) {                 /* close: one combined redraw, no flicker */
-        int x0 = cur_x < mx ? cur_x : mx, y0 = cur_y < my ? cur_y : my;
-        cur_blit(x0, y0, CUR_W + dx, CUR_H + dy, mx, my);
+        int x0 = (cur_x < mx ? cur_x : mx) - 1, y0 = (cur_y < my ? cur_y : my) - 1;
+        cur_blit(x0, y0, CUR_W + dx, CUR_H + dy, mx - 1, my - 1);
         cur_x = mx; cur_y = my;
     } else {                                        /* far: erase old, draw new */
-        cur_blit(cur_x, cur_y, CUR_W, CUR_H, -1000, -1000);
+        cur_blit(cur_x - 1, cur_y - 1, CUR_W, CUR_H, -1000, -1000);
         cursor_draw();
     }
 }
@@ -472,7 +647,7 @@ static void cursor_update(void) {                   /* call after the mouse move
  *  wallpaper (generated - orange dunes + warm sky, like the concept art)
  * ====================================================================== */
 static s16 ycurve[5][2048];
-static void build_wall(void) {
+static void build_wall_part(int y0, int y1) {
     static const s16 LB[5] = { 590, 650, 730, 820, 910 };     /* base y   (1/1000 H) */
     static const s16 LA[5] = {  45,  55,  60,  55,  40 };     /* amplitude           */
     static const s16 LF[5] = { 922, 1280, 768, 1434, 1126 };  /* cycles*1024 / width */
@@ -483,14 +658,15 @@ static void build_wall(void) {
     int x, y, i;
     int sx = W * 54 / 100, sy = H * 57 / 100, R = H * 40 / 100, core = H * 35 / 1000;
     s32 R2 = R * R, core2 = core * core, span = H * 22 / 100;
+    if (y0 == 0)
     for (i = 0; i < 5; i++)
         for (x = 0; x < W; x++) {
             s32 ang = LP[i] + (x * LF[i]) / W;
             ycurve[i][x] = (s16)(H * LB[i] / 1000 + (H * LA[i] / 1000) * isin(ang) / 1024
                                  + (H * LT[i] / 1000) * (x - W / 2) / W);
         }
-    for (y = 0; y < H; y++) {
-        u32 *row = WALL + y * W, skyc;
+    for (y = y0; y < y1; y++) {
+        u32 *row = WALL_D + y * W, skyc;
         s32 t = y * 256 / (H * 62 / 100);
         if (t > 256) t = 256;
         skyc = (t < 128) ? mix(0x3F8E9B, 0x8CC4C2, (u32)t * 2) : mix(0x8CC4C2, 0xF2DDB6, (u32)(t - 128) * 2);
@@ -519,6 +695,141 @@ static void build_wall(void) {
             row[x] = c;
         }
     }
+}
+
+/* ======================================================================
+ *  night-city wallpaper (generated - dark blurred skyline, cyan light bar,
+ *  reflective floor - like the Nexora concept image)
+ * ====================================================================== */
+static u32 hash32(u32 x) { x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16; return x; }
+static u32 dimc(u32 c, u32 f) { return ((((c & 0xFF00FF) * f) >> 8) & 0xFF00FF) | ((((c & 0x00FF00) * f) >> 8) & 0x00FF00); }
+static s16 nbt[2][2048];
+static int n_hz;
+static void night_prep(void) {
+    int l, x;
+    n_hz = H * 66 / 100;
+    for (l = 0; l < 2; l++) {
+        int xs = 0; u32 seed = (u32)l * 977u + 13u;
+        while (xs < W) {
+            u32 hh = hash32(seed++ * 2654435u);
+            int bw = W / 22 + (int)(hh % (u32)(W / 12));
+            int ht = (l ? 20 : 12) + (int)((hh >> 8) % 32u);
+            int top = n_hz - H * ht / 100;
+            if (l == 1 && ((hh >> 20) % 10u) < 3u) top = n_hz;            /* gap in the near row */
+            for (x = xs; x < xs + bw && x < W; x++) nbt[l][x] = (s16)top;
+            xs += bw;
+        }
+    }
+}
+static u32 scene_px(int x, int y) {
+    u32 c, t; int l;
+    if (y < 0) y = 0;
+    if (y >= n_hz) y = n_hz - 1;
+    t = (u32)y * 256u / (u32)n_hz;
+    c = mix(0x0A1118, 0x26394A, t);
+    if (t > 150) c = mix(c, 0x3A5560, (t - 150) * 3 / 4);
+    for (l = 0; l < 2; l++) {
+        if (y >= nbt[l][x]) {
+            u32 col = l ? 0x0B151B : 0x1A2C37, a = (u32)(y - nbt[l][x]) * 40u;
+            u32 hv = hash32((u32)((x / 12) * 7919 + (y / 16) * 104729 + l * 31));
+            if (a > 256) a = 256;
+            if ((hv & 63) < 4 && (x % 12) < 5 && (y % 16) < 7)
+                col = mix(col, (hv & 64) ? 0x6FD6D0 : 0xE8D9A8, l ? 70 : 45);   /* lit windows */
+            c = mix(c, col, a);
+        }
+    }
+    {   /* vertical cyan light bar */
+        int cx = W * 815 / 1000, hw = W / 100, d = x - cx, g = W / 24;
+        if (d < 0) d = -d;
+        if (d < hw) c = mix(c, 0x3CF2E8, 235);
+        else if (d < hw + g) { u32 f = (u32)(hw + g - d) * 256u / (u32)g; f = (f * f) >> 8; c = mix(c, 0x1FC4BC, f * 120 / 256); }
+    }
+    return c;
+}
+static void build_wall_night_part(u32 *dst, int y0, int y1) {
+    int x, y;
+    if (y0 == 0) night_prep();
+    for (y = y0; y < y1; y++) {
+        u32 *row = dst + y * W;
+        for (x = 0; x < W; x++) {
+            u32 c, vf; int ax_ = x - W / 2;
+            if (y < n_hz) c = scene_px(x, y);
+            else {
+                int d = y - n_hz; u32 f = (u32)d * 256u / (u32)(H - n_hz), ra = 100 - f * 85 / 256;
+                c = mix(0x0B1116, 0x020305, f);
+                c = mix(c, scene_px(x, n_hz - 1 - d * 2), ra);                   /* reflection */
+                if (d == 10 || d == 34 || d == 80 || d == 150) c = mix(c, 0x4A6772, 26);   /* gloss lines */
+                {   /* cyan light streak on the right side of the floor */
+                    int ys = H * 755 / 1000, dy = y - ys, xs = W * 86 / 100;
+                    if (dy < 0) dy = -dy;
+                    if (dy < 14 && x > xs) {
+                        u32 g = (u32)(14 - dy) * 256u / 14u, a = (u32)(x - xs) * 256u / (u32)(W - xs);
+                        g = (g * g) >> 8;
+                        c = mix(c, 0x35E8DC, (g * a >> 8) * 210 / 256);
+                    }
+                }
+            }
+            if (ax_ < 0) ax_ = -ax_;
+            vf = 256 - (u32)ax_ * 80u / (u32)(W / 2);
+            if (y < H / 8) vf = vf * (190u + (u32)y * 66u / (u32)(H / 8)) >> 8;
+            row[x] = dimc(c, vf);
+        }
+    }
+}
+
+/* ======================================================================
+ *  photo wallpapers: read from the disk image (walls.bin at sector 4096)
+ * ====================================================================== */
+#define WP_LBA 4096
+#define WP_W 800
+#define WP_H 450
+#define TW_ 128
+#define TH_ 72
+static const char *WPN[9] = { "Night City", "Desert", "Glass Spheres", "Blue Curves", "Twin Orbs", "Silk", "Fuji Autumn", "Sunset Cat", "Fantasy Falls" };
+static void thumb_from(u32 *dst, const u32 *src) {
+    int x, y;
+    for (y = 0; y < TH_; y++) for (x = 0; x < TW_; x++) dst[y * TW_ + x] = src[(y * H / TH_ + H / (2 * TH_)) * W + x * W / TW_ + W / (2 * TW_)];
+}
+static void wp_init(void) {                         /* find the wallpaper pack and load the previews */
+    u8 *raw = (u8 *)TMP; int i, k;
+    thumb_from(THUMBS, WALL_N); thumb_from(THUMBS + TW_ * TH_, WALL_D);
+    nwp = 0;
+    if (ata_read(WP_LBA, 1, raw) == 0 && raw[0] == 'N' && raw[1] == 'X' && raw[2] == 'W' && raw[3] == 'P') {
+        nwp = raw[4]; if (nwp > 7) nwp = 7;
+        for (i = 0; i < nwp; i++) {
+            if (ata_read(WP_LBA + 1 + (u32)i * 64, 54, raw)) { nwp = i; break; }
+            for (k = 0; k < TW_ * TH_; k++) THUMBS[(2 + i) * TW_ * TH_ + k] = ((u32)raw[k * 3] << 16) | ((u32)raw[k * 3 + 1] << 8) | raw[k * 3 + 2];
+        }
+    }
+}
+static void wp_load_photo(int p) {                  /* disk -> smooth upscale to the screen size */
+    static int xi[2048], yi_; static u8 xf[2048];
+    u8 *raw = (u8 *)TMP; u32 sx = ((u32)WP_W << 16) / (u32)W, sy = ((u32)WP_H << 16) / (u32)H; int x, y;
+    if (ata_read(WP_LBA + 1 + 8 * 64 + (u32)p * 2112, 2110, raw)) return;
+    for (x = 0; x < W; x++) {
+        u32 u = (u32)x * sx + (sx >> 1); u = u >= 0x8000 ? u - 0x8000 : 0;
+        xi[x] = (int)(u >> 16); xf[x] = (u8)((u >> 8) & 255);
+        if (xi[x] > WP_W - 2) { xi[x] = WP_W - 2; xf[x] = 255; }
+    }
+    for (y = 0; y < H; y++) {
+        u32 v = (u32)y * sy + (sy >> 1), fy; const u8 *r0, *r1; u32 *row = WALL_P + (u32)y * (u32)W;
+        v = v >= 0x8000 ? v - 0x8000 : 0; yi_ = (int)(v >> 16); fy = (v >> 8) & 255;
+        if (yi_ > WP_H - 2) { yi_ = WP_H - 2; fy = 255; }
+        r0 = raw + (u32)yi_ * WP_W * 3; r1 = r0 + WP_W * 3;
+        for (x = 0; x < W; x++) {
+            int i0 = xi[x] * 3; u32 fx = xf[x], c, out = 0;
+            for (c = 0; c < 3; c++) {
+                u32 top = r0[i0 + c] * (256 - fx) + r0[i0 + 3 + c] * fx, bot = r1[i0 + c] * (256 - fx) + r1[i0 + 3 + c] * fx;
+                out = (out << 8) | ((top * (256 - fy) + bot * fy) >> 16);
+            }
+            row[x] = out;
+        }
+    }
+}
+static u32 *wp_wall(void) { return wp_choice >= 2 ? WALL_P : (wp_choice ? WALL_D : WALL_N); }
+static void wp_select(int i) {
+    if (i >= 2) { if (i - 2 >= nwp) return; wp_load_photo(i - 2); }
+    wp_choice = i; WALL = wp_wall();
 }
 
 /* ======================================================================
@@ -572,11 +883,12 @@ static void rtc_time(struct tm_ *t) {
  *  UI pieces
  * ====================================================================== */
 static void glass(int x, int y, int w, int h, int r) {
-    rrect(x, y, w, h, r, 0xFFFFFF, 54);
-    rrect(x + 1, y + 1, w - 2, h - 2, r - 1, 0x0B1018, 118);
+    rrect(x, y, w, h, r, 0xFFFFFF, gl_edge);
+    rrect(x + 1, y + 1, w - 2, h - 2, r - 1, 0x0B1018, gl_fill);
 }
 static void time_str(const struct tm_ *t, char *out, char *ampm) {
     int h12 = t->h % 12 ? t->h % 12 : 12;
+    if (clock24) { char mm[4]; out[0] = 0; u2s(out, (u32)t->h, 2); scat(out, ":"); u2s(mm, (u32)t->m, 2); scat(out, mm); ampm[0] = 0; return; }
     out[0] = 0; u2s(out, (u32)h12, 1); scat(out, ":");
     { char mm[4]; u2s(mm, (u32)t->m, 2); scat(out, mm); }
     ampm[0] = t->h >= 12 ? 'P' : 'A'; ampm[1] = 'M'; ampm[2] = 0;
@@ -612,6 +924,15 @@ static void corner_brand(int x, int y) {
 /* ---- keyboard ---- */
 static const char SC_NORM[] = "\0\033" "1234567890-=\b\tqwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 ";
 static int  kb_shift, kb_ext;
+static int shift_sym(int c) {
+    switch (c) {
+    case '1': return '!'; case '2': return '@'; case '3': return '#'; case '4': return '$'; case '5': return '%';
+    case '6': return '^'; case '7': return '&'; case '8': return '*'; case '9': return '('; case '0': return ')';
+    case '-': return '_'; case '=': return '+'; case '[': return '{'; case ']': return '}'; case ';': return ':';
+    case '\'': return '"'; case ',': return '<'; case '.': return '>'; case '/': return '?'; case '\\': return '|'; case '`': return '~';
+    }
+    return c;
+}
 /* returns an ASCII char, or 0 for nothing, 10 = Enter, 8 = Backspace, 27 = Esc */
 static int key_char(void) {
     int sc = plat_key();
@@ -632,7 +953,7 @@ static int key_char(void) {
         }
         if (sc < (int)sizeof(SC_NORM) - 1) {
             int c = SC_NORM[sc];
-            if (kb_shift && c >= 'a' && c <= 'z') c -= 32;
+            if (kb_shift && c >= 'a' && c <= 'z') c -= 32; else if (kb_shift) c = shift_sym(c);
             return c;
         }
     }
@@ -649,6 +970,60 @@ static void splash_bg_rect(int x, int y, int w, int h) {
         fill_rect(x, j, w, 1, mix(0x1B1D23, 0x0D0E12, (u32)(j * 256 / H)), 256);
     }
 }
+/* ---- settings are saved on the disk (sector 2800) so they survive a restart ---- */
+#define ST_LBA 2800
+static int st_dirty;
+static void settings_save(void) {
+    static u8 sb[512], chk[512]; int i;
+    for (i = 0; i < 512; i++) sb[i] = 0;
+    sb[0] = 'N'; sb[1] = 'X'; sb[2] = 'S'; sb[3] = 'T';
+    sb[4] = (u8)wp_choice; sb[5] = (u8)mspeed; sb[6] = (u8)glass_lvl; sb[7] = (u8)show_w; sb[8] = (u8)clock24; sb[9] = (u8)cur_level;
+    sb[10] = (u8)accent; sb[11] = (u8)anim_lvl; sb[12] = (u8)accel_on;
+    for (i = 0; i < 23 && uname[i]; i++) sb[16 + i] = (u8)uname[i];
+    for (i = 0; i < 23 && upass[i]; i++) sb[40 + i] = (u8)upass[i];
+    save_state = -1;
+    if (ata_write(ST_LBA, sb) == 0 && ata_read(ST_LBA, 1, chk) == 0) {          /* read it back to be sure it really was written */
+        for (i = 0; i < 64 && chk[i] == sb[i]; i++) { }
+        if (i == 64) save_state = 1;
+    }
+}
+static void settings_load(void) {
+    static u8 sb[512]; int i, n;
+    if (ata_read(ST_LBA, 1, sb) != 0 || sb[0] != 'N' || sb[1] != 'X' || sb[2] != 'S' || sb[3] != 'T') return;
+    if (sb[5] <= 4) mspeed = sb[5];
+    if (sb[6] <= 4) glass_lvl = sb[6];
+    show_w = sb[7] ? 1 : 0; clock24 = sb[8] ? 1 : 0;
+    if (sb[9] <= 4) cur_level = sb[9];
+    if (sb[10] <= 5) accent = sb[10];
+    if (sb[11] <= 3) anim_lvl = sb[11];
+    accel_on = sb[12] ? 1 : 0;
+    for (n = 0; n < 23 && sb[16 + n] >= 32 && sb[16 + n] < 127; n++) { }
+    if (n > 0) { for (i = 0; i < n; i++) uname[i] = (char)sb[16 + i]; uname[n] = 0; }
+    for (n = 0; n < 23 && sb[40 + n] >= 32 && sb[40 + n] < 127; n++) { }
+    if (n >= 4) { for (i = 0; i < n; i++) upass[i] = (char)sb[40 + i]; upass[n] = 0; }
+    save_state = 1;
+    if (sb[4] == 1) { wp_choice = 1; WALL = WALL_D; }
+    else if (sb[4] >= 2 && sb[4] - 2 < nwp) { wp_load_photo(sb[4] - 2); wp_choice = sb[4]; WALL = WALL_P; }
+}
+
+/* ---- start-up work, done in small slices while the logo / loading bar is on screen ---- */
+static int bw_dune, bw_night, bw_disk;
+static int boot_work(u32 budget_ms) {                /* returns 1 when everything is ready */
+    u32 t0 = ms_now();
+    do {
+        if (bw_dune < H)       { int n = H - bw_dune < 8 ? H - bw_dune : 8; build_wall_part(bw_dune, bw_dune + n); bw_dune += n; }
+        else if (bw_night < H) { int n = H - bw_night < 8 ? H - bw_night : 8; build_wall_night_part(WALL_N, bw_night, bw_night + n); bw_night += n; }
+        else if (bw_disk == 0) { wp_init(); bw_disk = 1; }
+        else if (bw_disk == 1) { settings_load(); bw_disk = 2; }
+        else return 1;
+    } while (ms_now() - t0 < budget_ms);
+    return bw_dune >= H && bw_night >= H && bw_disk >= 2;
+}
+static u32 boot_progress(void) {                     /* 0..1000 */
+    u32 p = (u32)(bw_dune + bw_night) * 900u / (2u * (u32)H);
+    return p + (bw_disk >= 2 ? 100u : bw_disk ? 50u : 0u);
+}
+
 static void boot_sequence(void) {
     int dh = H * 46 / 100, dw, top, bar_w, bar_x, bar_y, lx, ly;
     u32 t0, e;
@@ -659,39 +1034,41 @@ static void boot_sequence(void) {
     bar_w = 480; if (bar_w > W - 100) bar_w = W - 100;
     bar_x = (W - bar_w) / 2; bar_y = top + dh + 56;
 
-    /* 1) dark cyan screen for 5 seconds (wallpaper is built meanwhile) */
+    /* 1) aqua-dark screen for half a second (the wallpapers already start building) */
     cv = BACK; fill_rect(0, 0, W, H, TEAL_COLOR, 256); present(0, 0, W, H);
     t0 = ms_now(); SNAP("01_teal");
-    cv = WALL; build_wall(); cv = BACK;
-    while (ms_now() - t0 < 5000) plat_wait(20);
+    while (ms_now() - t0 < 500) { if (boot_work(8)) plat_wait(8); }
 
-    /* 2) crossfade to dark splash background */
+    /* 2) blank, then the dark splash background opens */
     memcpy(SCR, BACK, (unsigned)W * H * 4);
     splash_bg_rect(0, 0, W, H);
     SNAP("02_before_fade");
-    crossfade(700);
+    crossfade_dip(500);
 
-    /* 3) logo fades in smoothly */
+    /* 3) logo fades in */
     t0 = ms_now();
-    while ((e = ms_now() - t0) < 1200) {
-        u32 f0 = ms_now(), a = e * 256 / 1200;
+    while ((e = ms_now() - t0) < 600) {
+        u32 f0 = ms_now(), a = e * 256 / 600;
         a = (a * a) >> 8;                                    /* ease-in */
+        boot_work(6);
         splash_bg_rect(lx - 4, ly - 4, dw + 8, dh + 8);
         draw_logo(lx, ly, dw, dh, a);
         present(lx - 4, ly - 4, dw + 8, dh + 8);
-        if (e > 600) SNAP("03_logo_fade");
+        if (e > 300) SNAP("03_logo_fade");
         frame_wait(f0, 16);
     }
     splash_bg_rect(lx - 4, ly - 4, dw + 8, dh + 8);
     draw_logo(lx, ly, dw, dh, 256); present(lx - 4, ly - 4, dw + 8, dh + 8);
 
-    /* 4) loading bar 0 -> 100 % over 4 seconds */
+    /* 4) loading bar: follows the real work, at least 1.2 s so it is smooth */
     t0 = ms_now();
     for (;;) {
-        u32 f0 = ms_now(), p;
-        char pct[8], msg[40];
-        e = f0 - t0; if (e > 4000) e = 4000;
-        p = e * 1000 / 4000;                                 /* 0..1000 */
+        u32 f0 = ms_now(), p, pt, pw;
+        char pct[8];
+        boot_work(10);
+        e = f0 - t0; if (e > 1200) e = 1200;
+        pt = e * 1000 / 1200; pw = boot_progress();
+        p = pt < pw ? pt : pw;
         splash_bg_rect(bar_x - 10, bar_y - 20, bar_w + 20, 120);
         rrect(bar_x, bar_y, bar_w, 8, 4, 0x2B2F38, 256);
         if (p > 0) {
@@ -705,121 +1082,49 @@ static void boot_sequence(void) {
         text_c(F_UI, W / 2, bar_y + 92,
                p < 250 ? "Initializing kernel..." : p < 500 ? "Loading drivers..." :
                p < 750 ? "Preparing display..." : "Starting Nexora OS...", 0xB8BCC8, 230);
-        (void)msg;
         present(bar_x - 10, bar_y - 20, bar_w + 20, 120);
         if (p >= 500) SNAP("04_progress");
-        if (e >= 4000) break;
+        if (p >= 1000) break;
         frame_wait(f0, 16);
     }
-    plat_wait(400);
+    plat_wait(120);
 }
 
 /* ======================================================================
- *  SCENE 2 : lock screen
+ *  NEW UI : small helpers
  * ====================================================================== */
-static void draw_login(int shake, int npw, int msg) {
-    int cx = W / 2, ty = H / 2 - 120, ay = ty + 62, fx, fy, fw = 400, i;
-    restore(cx - 330, ty - 12, 660, 450);
-    /* avatar */
-    disc(cx, ay, 66, 62, 0xFFFFFF, 0xFFFFFF, 120);
-    disc(cx, ay, 58, 0, 0x4C8DFF, 0x35D0FF, 256);
-    disc(cx, ay - 12, 15, 0, 0xFFFFFF, 0xFFFFFF, 245);
-    rrect(cx - 32, ay + 12, 64, 36, 18, 0xFFFFFF, 245);
-    text_c_sh(F_BIG, cx, ay + 58 + 52, USER_NAME, 0xFFFFFF, 256);
-    /* password field */
-    fx = cx - fw / 2 + shake; fy = ty + 232;
-    rrect(fx, fy, fw, 58, 29, 0xFFFFFF, 70);
-    rrect(fx + 1, fy + 1, fw - 2, 56, 28, 0x0B1018, 130);
-    if (npw == 0) draw_text(F_UI, fx + 30, fy + 37, "Password", 0xFFFFFF, 150);
-    for (i = 0; i < npw; i++) disc(fx + 34 + i * 22, fy + 29, 6, 0, 0xFFFFFF, 0xFFFFFF, 256);
-    disc(fx + fw - 31, fy + 29, 23, 0, 0x4C8DFF, 0x3466D6, 256);
-    text_c(F_BIG, fx + fw - 31, fy + 29 + 12, ">", 0xFFFFFF, 256);
-    /* message line */
-    if (msg == 1 || msg == 2) {
-        const char *m = (msg == 1) ? "Incorrect password. Try again." : "Welcome!";
-        int pw = text_w(F_UI, m) + 44;
-        rrect(cx - pw / 2, fy + 76, pw, 40, 20, msg == 1 ? 0xB3261E : 0x1E8E3E, 235);
-        text_c(F_UI, cx, fy + 103, m, 0xFFFFFF, 256);
-    } else {
-        text_c_sh(F_UI, cx, fy + 100, "Type your password and press Enter", 0xFFFFFF, 200);
-    }
-}
-static void compose_lock(void) {
-    memcpy(BACK, WALL, (unsigned)W * H * 4);
-    cv = BACK;
-    clock_panel();
-    corner_brand(44, H - 100);
-    text_sh(F_UI, W - 190, H - 48, "Nexora OS  v1.0", 0xFFFFFF, 220);
-    draw_login(0, 0, 0);
-}
-static void lock_screen(void) {
-    char pw[24]; int n = 0, k, lastm = -1; u32 tc = 0;
-    memcpy(SCR, BACK, (unsigned)W * H * 4);
-    compose_lock();
-    crossfade(800);
-    SNAP("05_lock_ready");
-    while (plat_key() >= 0) { }                             /* flush old key presses */
-    kb_shift = 0; kb_ext = 0;
-    for (;;) {
-        int c = key_char();
-        if (c == 8 && n > 0) { n--; draw_login(0, n, 0); present(W / 2 - 330, H / 2 - 132, 660, 450); }
-        else if (c == 27)    { n = 0; draw_login(0, n, 0); present(W / 2 - 330, H / 2 - 132, 660, 450); }
-        else if (c >= 32 && c < 127 && n < 20) {
-            pw[n++] = (char)c; draw_login(0, n, 0); present(W / 2 - 330, H / 2 - 132, 660, 450);
-        } else if (c == 10) {
-            pw[n] = 0;
-            { const char *p = NEXORA_PASSWORD; int ok = (n == (int)slen(p)); for (k = 0; ok && k < n; k++) if (pw[k] != p[k]) ok = 0;
-              if (ok) {
-                  draw_login(0, n, 2); present(W / 2 - 330, H / 2 - 132, 660, 450);
-                  SNAP("06_lock_ok"); plat_wait(450); return;
-              } }
-            { static const s8 sh[] = { -18, 18, -14, 14, -9, 9, -4, 4, 0 };
-              for (k = 0; k < 9; k++) { u32 f0 = ms_now(); draw_login(sh[k], n, 1); present(W / 2 - 330, H / 2 - 132, 660, 450); frame_wait(f0, 32); } }
-            n = 0; draw_login(0, 0, 1); present(W / 2 - 330, H / 2 - 132, 660, 450);
-            SNAP("06_lock_wrong");
-        }
-        if (ms_now() - tc > 400) {                          /* keep the clock correct */
-            struct tm_ t; tc = ms_now(); rtc_time(&t);
-            if (lastm >= 0 && t.m != lastm) { redraw_clock(); }
-            lastm = t.m;
-        }
-        plat_wait(8);
-    }
-}
+static u32 ui_acc = 0x2FD8D0;      /* accent colour (cyan on desktop, blue on lock screen) */
+static int ui_dark = 1;            /* 1 = dark cyan glass (desktop), 0 = light glass (lock) */
 
-/* ======================================================================
- *  SCENE 3 : loading after login (5 s)
- * ====================================================================== */
-static void loading_screen(void) {
-    int cx = W / 2, cy = H / 2, i, rx = cx - 260, ry = cy - 210, rw = 520, rh = 420;
-    u32 t0, e;
-    memcpy(SCR, BACK, (unsigned)W * H * 4);
-    memcpy(BACK, WALL, (unsigned)W * H * 4);
-    cv = BACK; fill_rect(0, 0, W, H, 0x05080E, 150);
-    crossfade(500);
-    t0 = ms_now();
-    while ((e = ms_now() - t0) < 5000) {
-        u32 f0 = ms_now(); int head = (int)(e / 90) % 12;
-        restore(rx, ry, rw, rh); fill_rect(rx, ry, rw, rh, 0x05080E, 150);
-        disc(cx, cy - 110, 46, 42, 0xFFFFFF, 0xFFFFFF, 110);
-        disc(cx, cy - 110, 38, 0, 0x4C8DFF, 0x35D0FF, 256);
-        disc(cx, cy - 120, 11, 0, 0xFFFFFF, 0xFFFFFF, 245);
-        rrect(cx - 24, cy - 104, 48, 26, 13, 0xFFFFFF, 245);
-        text_c_sh(F_BIG, cx, cy - 20, "Welcome, " USER_NAME, 0xFFFFFF, 256);
-        for (i = 0; i < 12; i++) {
-            int back = (head - i + 12) % 12; u32 al = 256 - (u32)back * 20; if (al < 40) al = 40;
-            disc(cx + icos(i * 85) * 30 / 1024, cy + 62 + isin(i * 85) * 30 / 1024, 5, 0, 0xFFFFFF, 0xFFFFFF, al);
-        }
-        text_c(F_UI, cx, cy + 140, "Loading your desktop...", 0xFFFFFF, 210);
-        present(rx, ry, rw, rh);
-        if (e > 2500) SNAP("07_loading");
-        frame_wait(f0, 40);
-    }
+static void panel(int x, int y, int w, int h, int r) {
+    if (ui_dark) { rrect(x, y, w, h, r, ACC2[accent], 64); rrect(x + 1, y + 1, w - 2, h - 2, r - 1, 0x08161C, GLA[glass_lvl]); }
+    else glass(x, y, w, h, r);
 }
+static void line(int x0, int y0, int x1, int y1, int t, u32 col, u32 a) {
+    int dx = x1 - x0, dy = y1 - y0, adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy, n = adx > ady ? adx : ady, i;
+    if (!n) n = 1;
+    for (i = 0; i <= n; i++) fill_rect(x0 + dx * i / n - t / 2, y0 + dy * i / n - t / 2, t, t, col, a);
+}
+static void diamond(int cx, int cy, int r, u32 col, u32 a) {            /* password symbol */
+    int x, y;
+    for (y = -r - 1; y <= r + 1; y++)
+        for (x = -r - 1; x <= r + 1; x++) {
+            int dx2 = 2 * x + 1, dy2 = 2 * y + 1, d2, t; u32 cov;
+            if (dx2 < 0) dx2 = -dx2;
+            if (dy2 < 0) dy2 = -dy2;
+            d2 = dx2 + dy2; t = 2 * r - d2;
+            if (t < -2) continue;
+            cov = (t >= 2) ? 256u : (u32)(128 + t * 64);
+            px_blend(cx + x, cy + y, col, (a * cov) >> 8);
+        }
+}
+static int text_r(const u8 *f, int rx, int yb, const char *s, u32 col, u32 a) { return draw_text(f, rx - text_w(f, s), yb, s, col, a); }
+static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+static int streq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+static int starts(const char *s, const char *p) { while (*p) { if (*s++ != *p++) return 0; } return 1; }
+static void itoa_s(char *o, int v) { if (v < 0) { *o++ = '-'; v = -v; } u2s(o, (u32)v, 1); }
+static int inrect(int px, int py, int x, int y, int w, int h) { return px >= x && px < x + w && py >= y && py < y + h; }
 
-/* ======================================================================
- *  SCENE 4 : desktop
- * ====================================================================== */
 static void cpu_brand(char *out) {
 #ifdef HOST
     host_cpu(out);
@@ -846,115 +1151,948 @@ static void text_fit(const u8 *f, int x, int yb, const char *s, int maxw, u32 co
     while (s[n] && n < 60) { buf[n] = s[n]; buf[n + 1] = 0; if (text_w(f, buf) > maxw) { buf[n] = 0; if (n > 3) { buf[n - 1] = buf[n - 2] = buf[n - 3] = '.'; } break; } n++; }
     draw_text(f, x, yb, buf, col, a);
 }
-static void tray_rect(int *x, int *y, int *w, int *h) { *x = W - 270; *y = H - 104; *w = 230; *h = 70; }
-static void tray(void) {
-    struct tm_ t; char ts[12], ap[4], full[20]; int x, y, w, h;
-    tray_rect(&x, &y, &w, &h); rtc_time(&t); time_str(&t, ts, ap);
-    full[0] = 0; scat(full, ts); scat(full, " "); scat(full, ap);
-    glass(x + 4, y + 4, w - 8, h - 8, 24);
-    text_c(F_BIG, x + w / 2, y + 46, full, 0xFFFFFF, 245);
-}
-static void redraw_tray(void) { int x, y, w, h; tray_rect(&x, &y, &w, &h); restore(x, y, w, h); tray(); present(x, y, w, h); }
 
-static void compose_desktop(void) {
-    static const u32 IC1[5] = { 0xFF7AA8, 0x35D0FF, 0x3A3F4A, 0xFFC371, 0x7CF29C };
-    static const u32 IC2[5] = { 0x7A5CFF, 0x3D7BE0, 0x0E1014, 0xFF5F6D, 0x1FA2A0 };
-    static const char *LAB[5] = { "Files", "Web", "Terminal", "Settings", "About" };
-    static const char *GLY[5] = { "F", "W", ">_", "S", "i" };
-    int i, dockw = 5 * 118 + 40, dx = (W - dockw) / 2, dy = H - 170, wx = 110, wy = 150, ww = 640, wh = 380;
-    char buf[64], cpu[64];
+/* ======================================================================
+ *  widgets (used on the lock screen AND on the desktop)
+ * ====================================================================== */
+static void wifi_icon(int x, int y, u32 col, u32 a) {
+    int i; for (i = 0; i < 4; i++) { int hh = i * 5 + 5; fill_rect(x + i * 7, y + 18 - hh, 5, hh, col, a); }
+}
+static void bt_icon(int cx, int y, u32 col, u32 a) {
+    line(cx, y, cx, y + 20, 2, col, a);
+    line(cx, y, cx + 7, y + 6, 2, col, a);   line(cx + 7, y + 6, cx - 7, y + 15, 2, col, a);
+    line(cx - 7, y + 5, cx + 7, y + 14, 2, col, a); line(cx + 7, y + 14, cx, y + 20, 2, col, a);
+}
+static void battery_icon(int x, int y) {
+    rrect(x, y, 32, 16, 4, 0xFFFFFF, 230);
+    rrect(x + 2, y + 2, 28, 12, 3, 0x0A1A22, 256);
+    rrect(x + 3, y + 3, 21, 10, 2, 0x7CF29C, 256);
+    fill_rect(x + 32, y + 5, 3, 6, 0xFFFFFF, 230);
+}
+static void w_status(int x, int y, int w, int h) {
+    char b[24], n[12];
+    panel(x, y, w, h, 18);
+    draw_text(F_UI, x + 18, y + 34, "System Status", 0xFFFFFF, 245);
+    fill_rect(x + 18, y + 46, w - 36, 1, 0xFFFFFF, 40);
+    draw_text(F_UI, x + 18, y + 80, "Status", 0xC9CED8, 220);  text_r(F_UI, x + w - 18, y + 80, "Online", 0x7CF29C, 256);
+    u2s(n, ms_now() / 60000u, 1); b[0] = 0; scat(b, n); scat(b, " min");
+    draw_text(F_UI, x + 18, y + 112, "Uptime", 0xC9CED8, 220);  text_r(F_UI, x + w - 18, y + 112, b, 0xFFFFFF, 245);
+    u2s(n, (u32)W, 1); b[0] = 0; scat(b, n); scat(b, "x"); u2s(n, (u32)H, 1); scat(b, n);
+    draw_text(F_UI, x + 18, y + 144, "Display", 0xC9CED8, 220); text_r(F_UI, x + w - 18, y + 144, b, 0xFFFFFF, 245);
+    (void)h;
+}
+static void w_calendar(int x, int y, int w, int h) {
+    static const char *WD[7] = { "S", "M", "T", "W", "T", "F", "S" };
+    struct tm_ t; char hd[40], n[12]; int cw = (w - 24) / 7, rh = (h - 96) / 6, i, first, nd;
+    rtc_time(&t);
+    panel(x, y, w, h, 18);
+    hd[0] = 0; scat(hd, MONTHS[t.mon - 1]); scat(hd, " "); u2s(n, (u32)t.year, 1); scat(hd, n);
+    draw_text(F_UI, x + 18, y + 34, hd, 0xFFFFFF, 245);
+    text_r(F_UI, x + w - 16, y + 34, ">", 0xC9CED8, 220);
+    text_r(F_UI, x + w - 40, y + 34, "<", 0xC9CED8, 220);
+    for (i = 0; i < 7; i++) text_c(F_UI, x + 12 + i * cw + cw / 2, y + 68, WD[i], 0xAEB8BE, 220);
+    first = dow(t.year, t.mon, 1); nd = dim(t.year, t.mon);
+    for (i = 1; i <= nd; i++) {
+        int idx = first + i - 1, col = idx % 7, row = idx / 7, cx = x + 12 + col * cw + cw / 2, yb = y + 96 + row * rh;
+        if (i == t.day) disc(cx, yb - 8, 13, 0, ui_acc, ui_acc, 256);
+        u2s(n, (u32)i, 1);
+        text_c(F_UI, cx, yb, n, i == t.day ? 0xFFFFFF : 0xDCE4E8, 240);
+    }
+}
+static void w_network(int x, int y, int w, int h) {
+    panel(x, y, w, h, 18);
+    draw_text(F_UI, x + 18, y + 34, "Network", 0xFFFFFF, 245);
+    fill_rect(x + 18, y + 46, w - 36, 1, 0xFFFFFF, 40);
+    wifi_icon(x + 20, y + 62, ui_acc, 256);
+    draw_text(F_UI, x + 62, y + 82, "Wi-Fi", 0xFFFFFF, 245);
+    draw_text(F_UI, x + 18, y + 118, "Not connected", 0xC9CED8, 230);
+    draw_text(F_UI, x + 18, y + 146, "No driver yet", ui_dark ? 0x8E99A2 : 0xE6ECEF, 220);
+    (void)h;
+}
+
+/* ======================================================================
+ *  PASSWORD / LOCK SCREEN (2 steps: 1 = widgets + "press Enter", 2 = password)
+ * ====================================================================== */
+static void login_rect(int *x, int *y, int *w, int *h) { *x = W / 2 - 330; *y = H / 2 - 132; *w = 660; *h = 450; }
+static void draw_avatar_name(int cx, int ay) {
+    disc(cx, ay, 66, 62, 0xFFFFFF, 0xFFFFFF, 120);
+    disc(cx, ay, 58, 0, 0x4C8DFF, 0x35D0FF, 256);
+    disc(cx, ay - 12, 15, 0, 0xFFFFFF, 0xFFFFFF, 245);
+    rrect(cx - 32, ay + 12, 64, 36, 18, 0xFFFFFF, 245);
+    text_c_sh(F_BIG, cx, ay + 58 + 52, uname, 0xFFFFFF, 256);
+}
+static void draw_login(int shake, int npw, int msg) {
+    int cx = W / 2, ty = H / 2 - 120, ay = ty + 62, fx, fy, fw = 440, i, vis, from;
+    int rx, ry, rw, rh; login_rect(&rx, &ry, &rw, &rh);
+    restore(rx, ry, rw, rh);
+    draw_avatar_name(cx, ay);
+    /* password field (moved lower) */
+    fx = cx - fw / 2 + shake; fy = ty + 272;
+    rrect(fx, fy, fw, 58, 29, 0xFFFFFF, 70);
+    rrect(fx + 1, fy + 1, fw - 2, 56, 28, 0x0B1018, 130);
+    if (npw == 0) draw_text(F_UI, fx + 30, fy + 37, "Password", 0xFFFFFF, 150);
+    vis = npw > 12 ? 12 : npw; from = npw - vis;
+    for (i = 0; i < vis; i++) diamond(fx + 38 + i * 28, fy + 29, 9, 0xFFFFFF, 256);   /* diamonds, not dots */
+    (void)from;
+    disc(fx + fw - 31, fy + 29, 23, 0, ui_dark ? 0x35E0D8 : 0x4C8DFF, ui_dark ? 0x1AA6B8 : 0x3466D6, 256);
+    text_c(F_BIG, fx + fw - 31, fy + 29 + 12, ">", ui_dark ? 0x06141A : 0xFFFFFF, 256);
+    if (msg == 1 || msg == 2) {
+        const char *m = (msg == 1) ? "Incorrect password. Try again." : "Welcome!";
+        int pw = text_w(F_UI, m) + 44;
+        rrect(cx - pw / 2, fy + 76, pw, 40, 20, msg == 1 ? 0xB3261E : 0x1E8E3E, 235);
+        text_c(F_UI, cx, fy + 103, m, 0xFFFFFF, 256);
+    } else {
+        text_c_sh(F_UI, cx, fy + 100, "Type your password and press Enter", 0xFFFFFF, 200);
+    }
+}
+static void lock_common(void) {
     memcpy(BACK, WALL, (unsigned)W * H * 4);
     cv = BACK;
+    if (WALL != WALL_D) { ui_dark = 1; ui_acc = ACC1[accent]; gl_fill = 118; gl_edge = 64; }   /* night: same look as desktop */
+    else                { ui_dark = 0; ui_acc = ACC1[accent]; gl_fill = 76;  gl_edge = 60; }   /* desert: transparent glass */
     clock_panel();
-    corner_brand(44, 34);
-    tray();
-    /* System Info window */
-    glass(wx, wy, ww, wh, 22);
-    fill_rect(wx + 14, wy + 47, ww - 28, 1, 0xFFFFFF, 50);
-    disc(wx + 30, wy + 24, 8, 0, 0xFF5F57, 0xFF5F57, 256);
-    disc(wx + 56, wy + 24, 8, 0, 0xFEBC2E, 0xFEBC2E, 256);
-    disc(wx + 82, wy + 24, 8, 0, 0x28C840, 0x28C840, 256);
-    text_c(F_UI, wx + ww / 2, wy + 31, "System Info", 0xFFFFFF, 230);
-    text_sh(F_BIG, wx + 36, wy + 108, "Nexora OS  v1.0", 0xFFFFFF, 256);
-    draw_text(F_UI, wx + 36, wy + 168, "Status", 0xC9CED8, 230);  draw_text(F_UI, wx + 170, wy + 168, "Online", 0x7CF29C, 256);
-    buf[0] = 0; { char n[8]; u2s(n, (u32)W, 1); scat(buf, n); scat(buf, " x "); u2s(n, (u32)H, 1); scat(buf, n); scat(buf, "  (32-bit colour)"); }
-    draw_text(F_UI, wx + 36, wy + 212, "Display", 0xC9CED8, 230); draw_text(F_UI, wx + 170, wy + 212, buf, 0xFFFFFF, 245);
-    cpu_brand(cpu);
-    draw_text(F_UI, wx + 36, wy + 256, "CPU", 0xC9CED8, 230);     text_fit(F_UI, wx + 170, wy + 256, cpu, ww - 170 - 30, 0xFFFFFF, 245);
-    draw_text(F_UI, wx + 36, wy + 300, "Boot", 0xC9CED8, 230);    draw_text(F_UI, wx + 170, wy + 300, "BIOS (Legacy), 32-bit protected mode", 0xFFFFFF, 245);
-    draw_text(F_UI, wx + 36, wy + 344, "Hint", 0xC9CED8, 230);    draw_text(F_UI, wx + 170, wy + 344, "Press L to lock the screen", 0xFFFFFF, 245);
-    /* dock */
-    glass(dx, dy, dockw, 130, 44);
-    for (i = 0; i < 5; i++) {
-        int icx = dx + 20 + 59 + i * 118, icy = dy + 50;
-        disc(icx, icy, 38, 0, IC1[i], IC2[i], 256);
-        disc(icx, icy, 38, 35, 0xFFFFFF, 0xFFFFFF, 70);
-        text_c(F_BIG, icx, icy + 12, GLY[i], i == 2 ? 0x7CF29C : 0xFFFFFF, 256);
-        text_c(F_UI, icx, dy + 112, LAB[i], 0xFFFFFF, 225);
-    }
+    corner_brand(44, H - 100);
+    text_sh(F_UI, W - 190, H - 48, "Nexora OS  v1.0", 0xFFFFFF, 220);
 }
-static int open_app = -1;
-static const char *APP_NAME[5] = { "Files", "Web", "Terminal", "Settings", "About" };
-static void app_rect(int *x, int *y, int *w, int *h) { *w = 600; *h = 420; *x = (W - *w) / 2 + 120; *y = 170; }
-static void draw_app_window(int i) {
-    int x, y, w, h; char t[40];
-    app_rect(&x, &y, &w, &h);
-    glass(x, y, w, h, 22);
-    fill_rect(x + 14, y + 47, w - 28, 1, 0xFFFFFF, 50);
-    disc(x + 30, y + 24, 8, 0, 0xFF5F57, 0xFF5F57, 256);          /* click = close */
-    disc(x + 56, y + 24, 8, 0, 0xFEBC2E, 0xFEBC2E, 256);
-    disc(x + 82, y + 24, 8, 0, 0x28C840, 0x28C840, 256);
-    text_c(F_UI, x + w / 2, y + 31, APP_NAME[i], 0xFFFFFF, 230);
-    t[0] = 0; scat(t, APP_NAME[i]);
-    text_c(F_BIG, x + w / 2, y + h / 2, t, 0xFFFFFF, 256);
-    text_c(F_UI, x + w / 2, y + h / 2 + 50, "This app is coming soon", 0xC9CED8, 230);
+static void compose_lock1(void) {
+    int cx = W / 2, ay = H / 2 - 70, px = cx - 175, py = ay + 150;
+    lock_common();
+    w_status(56, 56, 300, 170);
+    w_calendar(56, 240, 300, 270);
+    w_network(56, 524, 300, 160);
+    draw_avatar_name(cx, ay);
+    rrect(px, py, 350, 58, 29, 0xFFFFFF, 80);
+    rrect(px + 1, py + 1, 348, 56, 28, 0x0B1018, gl_fill);
+    text_c(F_UI, cx, py + 37, "Press Enter to unlock", 0xFFFFFF, 245);
 }
-/* returns dock icon index under (px,py), or -1 */
-static int dock_hit(int px, int py) {
-    int i, dockw = 5 * 118 + 40, dx = (W - dockw) / 2, dy = H - 170;
-    for (i = 0; i < 5; i++) {
-        int icx = dx + 20 + 59 + i * 118, icy = dy + 50;
-        int ax = px - icx, ay = py - icy;
-        if (ax * ax + ay * ay <= 38 * 38) return i;
-    }
-    return -1;
-}
-static void desktop_click(int px, int py) {
-    int x, y, w, h, hit;
-    if (open_app >= 0) {
-        int cx, cy;
-        app_rect(&x, &y, &w, &h); cx = px - (x + 30); cy = py - (y + 24);
-        if (cx * cx + cy * cy <= 12 * 12) {                        /* red button: close */
-            open_app = -1; compose_desktop(); present(0, 0, W, H); cursor_draw(); return;
-        }
-    }
-    hit = dock_hit(px, py);
-    if (hit >= 0) {
-        open_app = hit; compose_desktop(); draw_app_window(hit);
-        present(0, 0, W, H); cursor_draw();
-    }
-}
-static void desktop_screen(void) {
-    u32 tc = 0; int lastm = -1, shots = 0; u32 t0;
+static void compose_lock2(void) { lock_common(); draw_login(0, 0, 0); }
+static void lock_screen(void) {
+    char pw[24]; int n = 0, k, lastm = -1, rx, ry, rw, rh; u32 tc = 0;
+    login_rect(&rx, &ry, &rw, &rh);
+    WALL = wp_wall();                                       /* same wallpaper as the desktop */
     memcpy(SCR, BACK, (unsigned)W * H * 4);
-    compose_desktop();
-    crossfade(700);
-    t0 = ms_now();
+    compose_lock1();
+    crossfade(500);
+    SNAP("lock1");
+    mouse_reset();
+    while (plat_key() >= 0) { }                             /* flush old key presses */
     kb_shift = 0; kb_ext = 0;
-    open_app = -1; cur_on = 0; mouse_reset();
-    cursor_draw();
-    for (;;) {
-        int c = key_char();
-        if (c == 'l' || c == 'L') return;                   /* lock again */
-        if (mx != cur_x || my != cur_y) cursor_update();
-        if (mclick) { mclick = 0; desktop_click(mx, my); }
+    for (;;) {                                              /* step 1: wait for Enter */
+        int c; mouse_drain(); c = key_char();
+        if (c == 10 || mclick) break;
         if (ms_now() - tc > 400) {
             struct tm_ t; tc = ms_now(); rtc_time(&t);
-            if (lastm >= 0 && t.m != lastm) { redraw_clock(); redraw_tray(); cursor_draw(); }
+            if (lastm >= 0 && t.m != lastm) redraw_clock();
             lastm = t.m;
         }
-        if (!shots && ms_now() - t0 > 800) { SNAP("08_desktop"); shots = 1; }
-        plat_wait(1);                                       /* 1 ms: fast enough for mouse packets */
+        plat_wait(8);
+    }
+    mclick = 0;
+    memcpy(SCR, BACK, (unsigned)W * H * 4);                 /* step 2: password screen */
+    compose_lock2();
+    crossfade(300);
+    SNAP("lock2");
+    for (;;) {
+        int c; mouse_drain(); c = key_char();
+        mclick = 0;
+        if (c == 8 && n > 0) { n--; draw_login(0, n, 0); present(rx, ry, rw, rh); }
+        else if (c == 27)    { n = 0; draw_login(0, n, 0); present(rx, ry, rw, rh); }
+        else if (c >= 32 && c < 127 && n < 20) {
+            pw[n++] = (char)c; draw_login(0, n, 0); present(rx, ry, rw, rh);
+            if (n == 5) SNAP("lock2_typing");
+        } else if (c == 10) {
+            pw[n] = 0;
+            { const char *p = upass; int ok = (n == (int)slen(p)); for (k = 0; ok && k < n; k++) if (pw[k] != p[k]) ok = 0;
+              if (ok) {
+                  draw_login(0, n, 2); present(rx, ry, rw, rh);
+                  SNAP("lock2_ok"); plat_wait(250); return;
+              } }
+            { static const s8 sh[] = { -18, 18, -14, 14, -9, 9, -4, 4, 0 };
+              for (k = 0; k < 9; k++) { u32 f0 = ms_now(); draw_login(sh[k], n, 1); present(rx, ry, rw, rh); frame_wait(f0, 32); } }
+            n = 0; draw_login(0, 0, 1); present(rx, ry, rw, rh);
+            SNAP("lock2_wrong");
+        }
+        if (ms_now() - tc > 400) {
+            struct tm_ t; tc = ms_now(); rtc_time(&t);
+            if (lastm >= 0 && t.m != lastm) redraw_clock();
+            lastm = t.m;
+        }
+        plat_wait(8);
+    }
+}
+
+/* ======================================================================
+ *  SCENE 4 : DESKTOP  (top bar, widgets, windows, start menu, taskbar, apps)
+ * ====================================================================== */
+#define NAPPS 5
+#define AW 780
+#define AH 520
+static const char *APPN[NAPPS] = { "Explorer", "Notepad", "Calculator", "Terminal", "Settings" };
+static const char *APPS[NAPPS] = { "Files", "Notepad", "Calc", "Terminal", "Settings" };
+static const u32 IC1[NAPPS] = { 0x4FA3FF, 0xFFC371, 0x7CF29C, 0x3A3F4A, 0xFF7AA8 };
+static const u32 IC2[NAPPS] = { 0x2B6BE0, 0xF08A24, 0x1FA2A0, 0x0E1014, 0x7A5CFF };
+
+/* ---- desktop state ---- */
+static int open_app = -1, menu_open = 1, ax, ay, drag, dgx, dgy, hov_menu = -1, hov_tb = -1;
+static int sfocus, want_lock;
+static char sbuf[24]; static int sn;
+static int dr_x, dr_y, dr_w;                       /* last drawn app window (for erasing) */
+/* notepad */
+static char npbuf[2048]; static int nplen;
+/* terminal */
+#define TL_N 13
+static char tl[TL_N][96]; static int tln; static char tin[72]; static int tinn;
+/* calculator */
+static s32 cacc, cval; static int cop, cnew = 1, cerr;
+
+/* ---- geometry ---- */
+static void lb_geom(int *cx, int *cy, int *r) { *cx = 56 + 62; *cy = H - 112; *r = 62; }
+static void menu_rect(int *x, int *y, int *w, int *h) { *x = 56; *w = 290; *h = NAPPS * 64 + 24; *y = (H - 112 - 62 + 24) - *h; }
+static void tb_rect(int *x, int *y, int *w, int *h) { *w = 1500; if (*w > W - 420) *w = W - 420; *x = (W - *w) / 2; *y = H - 140; *h = 96; }
+static void tb_search(int *x, int *y, int *w, int *h) { int px, py, pw, ph; tb_rect(&px, &py, &pw, &ph); *x = px + 140; *y = py + 22; *w = 250; *h = 52; }
+static void tb_icon(int i, int *cx, int *cy) { int px, py, pw, ph; tb_rect(&px, &py, &pw, &ph); *cx = px + 414 + 48 + i * 96; *cy = py + 34; }
+static void tb_tog(int i, int *cx, int *cy)  { int px, py, pw, ph; tb_rect(&px, &py, &pw, &ph); *cx = px + 914 + 52 + i * 104; *cy = py + 36; }
+static void tb_sld(int i, int *x, int *y)    { int px, py, pw, ph; tb_rect(&px, &py, &pw, &ph); *x = px + 1138 + i * 124 + 13; *y = py + 36; }   /* track is 98 px wide */
+static void tb_desk(int *cx, int *cy)        { int px, py, pw, ph; tb_rect(&px, &py, &pw, &ph); *cx = px + 1402 + 48; *cy = py + 34; }
+/* what is under (qx,qy): 0..4 app, 5 desktop, 6 search, 7 clock, 8/9 toggles, 10/11 sliders, -1 nothing */
+static int tb_hit(int qx, int qy) {
+    int px, py, pw, ph, rx;
+    tb_rect(&px, &py, &pw, &ph);
+    if (!inrect(qx, qy, px, py, pw, ph)) return -1;
+    rx = qx - px;
+    if (rx < 120) return 7;
+    if (rx >= 140 && rx < 390) return (qy >= py + 22 && qy < py + 74) ? 6 : -1;
+    if (rx >= 414 && rx < 894) return (rx - 414) / 96;
+    if (rx >= 914 && rx < 1122) return 8 + (rx - 914) / 104;
+    if (rx >= 1138 && rx < 1386) return 10 + (rx - 1138) / 124;
+    if (rx >= 1402) return 5;
+    return -1;
+}
+
+/* ---- icons ---- */
+static void app_icon(int i, int cx, int cy, int r) {
+    disc(cx, cy, r, 0, IC1[i], IC2[i], 256);
+    disc(cx, cy, r, r - 3, 0xFFFFFF, 0xFFFFFF, 55);
+    switch (i) {
+    case 0:
+        rrect(cx - 13, cy - 11, 13, 9, 3, 0xFFD36E, 256);
+        rrect(cx - 13, cy - 6, 26, 18, 4, 0xFFE08F, 256);
+        break;
+    case 1:
+        rrect(cx - 10, cy - 13, 20, 26, 3, 0xFFFFFF, 250);
+        fill_rect(cx - 6, cy - 6, 12, 2, 0xC77B1E, 256); fill_rect(cx - 6, cy, 12, 2, 0xC77B1E, 256); fill_rect(cx - 6, cy + 6, 8, 2, 0xC77B1E, 256);
+        break;
+    case 2: {
+        int a, b;
+        rrect(cx - 11, cy - 13, 22, 26, 3, 0xFFFFFF, 250);
+        fill_rect(cx - 8, cy - 10, 16, 6, 0x1FA2A0, 256);
+        for (a = 0; a < 3; a++) for (b = 0; b < 2; b++) fill_rect(cx - 8 + a * 6, cy - 1 + b * 7, 4, 4, 0x6B7A84, 256);
+        break; }
+    case 3:
+        text_c(F_BIG, cx, cy + 12, ">_", 0x7CF29C, 256);
+        break;
+    default:
+        disc(cx, cy, 12, 7, 0xFFFFFF, 0xFFFFFF, 250);
+        fill_rect(cx - 3, cy - 17, 6, 7, 0xFFFFFF, 250); fill_rect(cx - 3, cy + 10, 6, 7, 0xFFFFFF, 250);
+        fill_rect(cx - 17, cy - 3, 7, 6, 0xFFFFFF, 250); fill_rect(cx + 10, cy - 3, 7, 6, 0xFFFFFF, 250);
+        break;
+    }
+}
+
+/* ---- top bar ---- */
+static void topbar(void) {
+    struct tm_ t; char ts[12], ap[4], full[20]; int rx = W - 24, nx;
+    rtc_time(&t); time_str(&t, ts, ap);
+    full[0] = 0; scat(full, ts); if (ap[0]) { scat(full, " "); scat(full, ap); }
+    fill_rect(0, 0, W, 48, 0x03060A, 150);
+    fill_rect(0, 48, W, 1, ACC2[accent], 46);
+    draw_logo(18, 7, 30, 35, 256);
+    nx = draw_text(F_UI, 60, 32, "NEXORA OS", 0xFFFFFF, 245);
+    draw_text(F_UI, nx + 36, 32, "v1.0", 0xAEB8BE, 220);
+    text_r(F_UI, rx, 32, full, 0xFFFFFF, 250);
+    rx -= text_w(F_UI, full) + 34;
+    battery_icon(rx - 35, 16);
+    rx -= 35 + 30;
+    wifi_icon(rx - 26, 15, 0xFFFFFF, 240);
+    rx -= 26 + 30;
+    bt_icon(rx - 4, 14, 0xFFFFFF, 240);
+}
+
+/* ---- window frames (concept style: title left, controls right) ---- */
+static void win_controls(int x, int y, int w) {
+    int cy = y + 22;
+    fill_rect(x + w - 92, cy + 4, 12, 2, 0xFFFFFF, 220);
+    fill_rect(x + w - 60, cy - 6, 12, 2, 0xFFFFFF, 220); fill_rect(x + w - 60, cy + 4, 12, 2, 0xFFFFFF, 220);
+    fill_rect(x + w - 60, cy - 6, 2, 12, 0xFFFFFF, 220); fill_rect(x + w - 50, cy - 6, 2, 12, 0xFFFFFF, 220);
+    line(x + w - 28, cy - 6, x + w - 16, cy + 6, 2, 0xFFFFFF, 230);
+    line(x + w - 28, cy + 6, x + w - 16, cy - 6, 2, 0xFFFFFF, 230);
+}
+static void win_frame(int x, int y, int w, int h, const char *title, u32 fill) {
+    rrect(x, y, w, h, 14, ACC2[accent], 70);
+    rrect(x + 1, y + 1, w - 2, h - 2, 13, 0x08161C, fill);
+    fill_rect(x + 12, y + 44, w - 24, 1, 0xFFFFFF, 36);
+    draw_text(F_UI, x + 18, y + 30, title, 0xDDE6EA, 235);
+    win_controls(x, y, w);
+}
+/* ---- the static desktop (everything that never changes between clicks) ---- */
+static void build_desk(void) {
+    memcpy(BACK, WALL, (unsigned)W * H * 4);
+    cv = BACK; ui_dark = 1; ui_acc = ACC1[accent];
+    topbar();
+    if (show_w) {
+        w_status(W - 276, 68, 250, 170);
+        w_calendar(W - 276, 252, 250, 246);
+        w_network(W - 276, 512, 250, 160);
+    }
+}
+
+/* ---- start menu / logo button / taskbar ---- */
+static void draw_menu(void) {
+    int x, y, w, h, i; menu_rect(&x, &y, &w, &h);
+    panel(x, y, w, h, 22);
+    for (i = 0; i < NAPPS; i++) {
+        int iy = y + 12 + i * 64, sel = (open_app == i), hv = (hov_menu == i);
+        if (sel || hv) {
+            rrect(x + 8, iy, w - 16, 56, 14, ui_acc, sel ? 230 : 130);
+            rrect(x + 10, iy + 2, w - 20, 52, 12, 0x0A1D24, 235);
+        }
+        app_icon(i, x + 40, iy + 28, 22);
+        draw_text(F_UI, x + 78, iy + 36, APPN[i], 0xFFFFFF, 250);
+        draw_text(F_UI, x + w - 34, iy + 36, ">", 0xAEB8BE, 220);
+    }
+}
+static void lb_rect(int *x, int *y, int *w, int *h) { int cx, cy, r; lb_geom(&cx, &cy, &r); *x = cx - r - 10; *y = cy - r - 10; *w = 2 * r + 20; *h = 2 * r + 20; }
+static void draw_logo_btn(void) {
+    int cx, cy, r; lb_geom(&cx, &cy, &r);
+    disc(cx, cy, r + 8, r, ui_acc, ui_acc, menu_open ? 110 : 55);
+    disc(cx, cy, r, 0, 0x0A2229, 0x04121A, 245);
+    disc(cx, cy, r, r - 4, ui_acc, dimc(ui_acc, 170), 256);
+    draw_logo(cx - 26, cy - 30, 52, 60, 256);
+}
+static void draw_taskbar(void) {
+    int px, py, pw, ph, i, cx, cy, sx, sy, sw, sh; struct tm_ t;
+    static const short DV[5] = { 120, 402, 906, 1130, 1394 };
+    tb_rect(&px, &py, &pw, &ph);
+    panel(px, py, pw, ph, 48);
+    rrect(px + 70, py, pw - 140, 2, 1, ui_acc, 200);                 /* glowing edges like the concept */
+    rrect(px + 70, py + ph - 2, pw - 140, 2, 1, ui_acc, 110);
+    for (i = 0; i < 5; i++) fill_rect(px + DV[i], py + 20, 1, 56, 0xFFFFFF, 40);
+    /* analog clock button */
+    cx = px + 60; cy = py + 48; rtc_time(&t);
+    if (hov_tb == 7) disc(cx, cy, 34, 0, 0xFFFFFF, 0xFFFFFF, 28);
+    disc(cx, cy, 30, 0, 0x0B242B, 0x08161C, 240);
+    disc(cx, cy, 30, 28, ui_acc, ui_acc, 220);
+    {
+        int am = t.m * 1024 / 60, ah = ((t.h % 12) * 60 + t.m) * 1024 / 720;
+        line(cx, cy, cx + isin(ah) * 13 / 1024, cy - icos(ah) * 13 / 1024, 3, 0xFFFFFF, 256);
+        line(cx, cy, cx + isin(am) * 21 / 1024, cy - icos(am) * 21 / 1024, 2, 0xFFFFFF, 256);
+        disc(cx, cy, 3, 0, ui_acc, ui_acc, 256);
+    }
+    /* search bar */
+    tb_search(&sx, &sy, &sw, &sh);
+    rrect(sx, sy, sw, sh, 26, sfocus ? ui_acc : 0xFFFFFF, sfocus ? 230 : (hov_tb == 6 ? 110 : 60));
+    rrect(sx + 1, sy + 1, sw - 2, sh - 2, 25, 0x06121A, 225);
+    disc(sx + 25, sy + 24, 9, 6, 0xFFFFFF, 0xFFFFFF, 235);
+    line(sx + 31, sy + 30, sx + 38, sy + 37, 3, 0xFFFFFF, 256);
+    if (!sn) draw_text(F_UI, sx + 54, sy + 34, "Search apps...", 0x8E99A2, 230);
+    else {
+        int tx = draw_text(F_UI, sx + 54, sy + 34, sbuf, 0xFFFFFF, 250), m = -1;
+        for (i = 0; i < NAPPS && m < 0; i++) { int k = 0; while (k < sn && lc(APPN[i][k]) == lc(sbuf[k])) k++; if (k == sn) m = i; }
+        if (sfocus) fill_rect(tx + 2, sy + 14, 2, 24, 0xFFFFFF, 230);
+        if (m >= 0 && text_w(F_UI, APPN[m]) < sw - 54 - (tx - sx - 54) - 40) text_r(F_UI, sx + sw - 18, sy + 34, APPN[m], ui_acc, 240);
+    }
+    if (sfocus && !sn) fill_rect(sx + 54, sy + 14, 2, 24, 0xFFFFFF, 230);
+    /* apps */
+    for (i = 0; i < NAPPS; i++) {
+        tb_icon(i, &cx, &cy);
+        if (hov_tb == i) rrect(cx - 44, py + 6, 88, 84, 16, 0xFFFFFF, 28);
+        app_icon(i, cx, cy, 26);
+        text_c(F_UI, cx, py + 86, APPS[i], 0xFFFFFF, 235);
+        if (open_app == i) rrect(cx - 10, py + 2, 20, 3, 1, ui_acc, 256);
+    }
+    /* toggle switches */
+    for (i = 0; i < 2; i++) {
+        int on = i ? clock24 : show_w;
+        tb_tog(i, &cx, &cy);
+        rrect(cx - 26, cy - 14, 52, 28, 14, on ? ui_acc : 0x3A4650, 256);
+        disc(cx + (on ? 12 : -12), cy, 10, 0, 0xFFFFFF, 0xFFFFFF, 256);
+        text_c(F_UI, cx, py + 86, i ? "24h" : "Widgets", 0xFFFFFF, 235);
+    }
+    /* sliders: mouse speed + glass opacity */
+    for (i = 0; i < 2; i++) {
+        int v = i ? glass_lvl : mspeed, kx;
+        tb_sld(i, &sx, &sy);
+        kx = sx + v * 98 / 4;
+        rrect(sx, sy - 3, 98, 6, 3, 0xFFFFFF, 70);
+        rrect(sx, sy - 3, kx - sx + 2, 6, 3, ui_acc, 256);
+        disc(kx, sy, 11, 0, 0xFFFFFF, 0xFFFFFF, 256);
+        disc(kx, sy, 5, 0, ui_acc, ui_acc, 256);
+        text_c(F_UI, sx + 49, py + 86, i ? "Glass" : "Speed", 0xFFFFFF, 235);
+    }
+    /* desktop button */
+    tb_desk(&cx, &cy);
+    if (hov_tb == 5) rrect(cx - 44, py + 6, 88, 84, 16, 0xFFFFFF, 28);
+    rrect(cx - 15, cy - 11, 30, 22, 5, ui_acc, 256);
+    rrect(cx - 12, cy - 8, 24, 16, 3, 0x08161C, 256);
+    text_c(F_UI, cx, py + 86, "Desktop", 0xFFFFFF, 235);
+}
+
+/* ---- applications ---- */
+static void term_print(const char *s) {
+    int i;
+    if (tln == TL_N) { int r; for (r = 1; r < TL_N; r++) for (i = 0; i < 96; i++) tl[r - 1][i] = tl[r][i]; tln--; }
+    for (i = 0; s[i] && i < 90; i++) tl[tln][i] = s[i];
+    tl[tln][i] = 0; tln++;
+}
+static void term_init(void) {
+    tln = 0; tinn = 0; tin[0] = 0;
+    term_print("Nexora OS Terminal v1.0");
+    term_print("Type 'help' to see the commands.");
+}
+static void launch(int i);
+static void term_exec(void) {
+    char out[96]; struct tm_ t; char a[16], ap[4];
+    out[0] = 0; scat(out, "nexora> "); scat(out, tin); term_print(out);
+    if (!tinn) { }
+    else if (streq(tin, "help")) { term_print("help clear ver time date cpu res lock"); term_print("echo <text>  notepad calc files settings exit"); }
+    else if (streq(tin, "clear")) { tln = 0; }
+    else if (streq(tin, "ver")) term_print("Nexora OS v1.0 (32-bit, BIOS legacy)");
+    else if (streq(tin, "time")) { rtc_time(&t); time_str(&t, out, ap); scat(out, " "); scat(out, ap); term_print(out); }
+    else if (streq(tin, "date")) { rtc_time(&t); date_str(&t, out); u2s(a, (u32)t.year, 1); scat(out, " "); scat(out, a); term_print(out); }
+    else if (streq(tin, "cpu")) { cpu_brand(out); term_print(out); }
+    else if (streq(tin, "res")) { u2s(a, (u32)W, 1); out[0] = 0; scat(out, a); scat(out, " x "); u2s(a, (u32)H, 1); scat(out, a); term_print(out); }
+    else if (streq(tin, "lock")) want_lock = 1;
+    else if (starts(tin, "echo ")) term_print(tin + 5);
+    else if (streq(tin, "notepad")) launch(1);
+    else if (streq(tin, "calc")) launch(2);
+    else if (streq(tin, "files")) launch(0);
+    else if (streq(tin, "settings")) launch(4);
+    else if (streq(tin, "exit")) open_app = -1;
+    else term_print("Unknown command. Type 'help'.");
+    tinn = 0; tin[0] = 0;
+}
+static void calc_apply(void) {
+    s32 a = cacc < 0 ? -cacc : cacc, b = cval < 0 ? -cval : cval;
+    switch (cop) {
+    case '+': cacc += cval; break;
+    case '-': cacc -= cval; break;
+    case '*': if (b && a > 999999999 / b) cerr = 1; else cacc *= cval; break;
+    case '/': if (cval == 0) cerr = 1; else cacc /= cval; break;
+    default: cacc = cval; break;
+    }
+    if (cacc > 999999999 || cacc < -999999999) cerr = 1;
+}
+static void calc_key(int k) {
+    if (k == 'C') { cacc = cval = 0; cop = 0; cnew = 1; cerr = 0; return; }
+    if (cerr) { if (k >= '0' && k <= '9') { cerr = 0; cacc = cval = 0; cop = 0; cnew = 1; } else return; }
+    if (k >= '0' && k <= '9') { if (cnew) { cval = 0; cnew = 0; } if (cval < 100000000) cval = cval * 10 + (k - '0'); return; }
+    if (k == '<') { cval /= 10; return; }
+    if (k == '=') { if (cop) { calc_apply(); cval = cacc; cop = 0; } cnew = 1; return; }
+    if (cop && !cnew) { calc_apply(); cval = cacc; } else if (!cop) cacc = cval;
+    cop = k; cnew = 1;
+}
+static const char CB[4][4] = { { '7', '8', '9', '/' }, { '4', '5', '6', '*' }, { '1', '2', '3', '-' }, { 'C', '0', '=', '+' } };
+#define CBW 100
+#define CBH 62
+#define CBG 12
+
+static void app_notepad(void) {
+    int x = ax + 16, y = ay + 56, w = AW - 32, h = AH - 72 - 34, i, pad = 16, maxw = w - 2 * pad, lh = 30;
+    int vis = (h - 2 * pad) / lh, nl = 0, lx = 0, k;
+    static int ls[260]; char tmp[200]; char n[12], st[40];
+    rrect(x, y, w, h, 10, 0x04080B, 215);
+    if (!nplen) draw_text(F_UI, x + pad, y + pad + 22, "Start typing...", 0x6C7A84, 230);
+    ls[0] = 0;
+    for (i = 0; i < nplen; i++) {
+        char s[2]; int cw_;
+        if (npbuf[i] == '\n') { if (nl < 258) ls[++nl] = i + 1; lx = 0; continue; }
+        s[0] = npbuf[i]; s[1] = 0; cw_ = text_w(F_UI, s);
+        if (lx + cw_ > maxw) { if (nl < 258) ls[++nl] = i; lx = 0; }
+        lx += cw_;
+    }
+    ls[nl + 1] = nplen + 1;
+    {
+        int first = nl + 1 > vis ? nl + 1 - vis : 0, ln;
+        for (ln = first; ln <= nl; ln++) {
+            int a = ls[ln], b = (ln == nl) ? nplen : ls[ln + 1]; int yy = y + pad + 22 + (ln - first) * lh, tx;
+            for (k = 0; a < b && k < 198; a++) if (npbuf[a] != '\n') tmp[k++] = npbuf[a];
+            tmp[k] = 0;
+            tx = draw_text(F_UI, x + pad, yy, tmp, 0xFFFFFF, 250);
+            if (ln == nl) fill_rect(tx + 1, yy - 18, 2, 24, ui_acc, 256);
+        }
+    }
+    u2s(n, (u32)nplen, 1); st[0] = 0; scat(st, "Characters: "); scat(st, n);
+    draw_text(F_UI, x + 4, ay + AH - 14, st, 0x8E99A2, 230);
+    text_r(F_UI, x + w, ay + AH - 14, "Esc = close", 0x6C7A84, 220);
+}
+static void app_terminal(void) {
+    int x = ax + 16, y = ay + 56, w = AW - 32, h = AH - 72, i, tx; char p[100];
+    rrect(x, y, w, h, 10, 0x03070A, 240);
+    for (i = 0; i < tln; i++) draw_text(F_UI, x + 16, y + 34 + i * 29, tl[i], starts(tl[i], "nexora>") ? 0x7CF29C : 0xDDE6EA, 245);
+    tx = draw_text(F_UI, x + 16, y + 34 + tln * 29, "nexora> ", 0x7CF29C, 250);
+    p[0] = 0; scat(p, tin);
+    tx = draw_text(F_UI, tx, y + 34 + tln * 29, p, 0xFFFFFF, 250);
+    fill_rect(tx + 2, y + 34 + tln * 29 - 18, 11, 3 + 20, 0xFFFFFF, 200);
+}
+static void app_calc(void) {
+    int gx = ax + (AW - (4 * CBW + 3 * CBG)) / 2, gy = ay + 150, r, c; char ds[16];
+    rrect(gx, ay + 60, 4 * CBW + 3 * CBG, 76, 14, 0x04080B, 225);
+    if (cerr) { ds[0] = 0; scat(ds, "Error"); } else itoa_s(ds, cval);
+    text_r(F_BIG, gx + 4 * CBW + 3 * CBG - 22, ay + 112, ds, cerr ? 0xFF8A80 : 0xFFFFFF, 256);
+    if (cop && !cerr) { char o[2]; o[0] = (char)cop; o[1] = 0; draw_text(F_UI, gx + 20, ay + 90, o, ui_acc, 256); }
+    for (r = 0; r < 4; r++)
+        for (c = 0; c < 4; c++) {
+            int bx = gx + c * (CBW + CBG), by = gy + r * (CBH + CBG), k = CB[r][c];
+            int isop = (k == '/' || k == '*' || k == '-' || k == '+'), hit = inrect(mx, my, bx, by, CBW, CBH);
+            char lab[2]; lab[0] = (char)k; lab[1] = 0;
+            if (k == '=') rrect(bx, by, CBW, CBH, 14, ui_acc, hit ? 256 : 225);
+            else if (k == 'C') rrect(bx, by, CBW, CBH, 14, 0xFF6F61, hit ? 210 : 150);
+            else if (isop) rrect(bx, by, CBW, CBH, 14, ui_acc, hit ? 130 : 80);
+            else rrect(bx, by, CBW, CBH, 14, 0xFFFFFF, hit ? 56 : 28);
+            text_c(F_BIG, bx + CBW / 2, by + CBH / 2 + 12, lab, k == '=' ? 0x06141A : 0xFFFFFF, 256);
+        }
+}
+static void app_explorer(void) {
+    static const char *FN[6] = { "Documents", "Downloads", "Pictures", "Music", "Videos", "Desktop" };
+    int i, x = ax + 16, y = ay + 56;
+    rrect(x, y, AW - 32, 40, 10, 0xFFFFFF, 16);
+    draw_text(F_UI, x + 16, y + 28, "This PC  >  Home", 0xDDE6EA, 245);
+    for (i = 0; i < 6; i++) {
+        int cx = ax + 40 + (i % 3) * 244, cy = ay + 120 + (i / 3) * 170;
+        rrect(cx, cy, 224, 150, 14, 0xFFFFFF, 14);
+        rrect(cx + 62, cy + 22, 44, 20, 6, 0xF2B84B, 256);
+        rrect(cx + 62, cy + 32, 100, 66, 8, 0xFFD36E, 256);
+        text_c(F_UI, cx + 112, cy + 130, FN[i], 0xFFFFFF, 245);
+    }
+    draw_text(F_UI, x + 4, ay + AH - 14, "File system support is coming soon.", 0x8E99A2, 230);
+}
+static void dyn_redraw(void);
+static void refresh_all(void);
+/* ---- settings: 3 tabs (Display / Mouse / System), geometry is relative to the window ---- */
+#define WT_X 40
+#define WT_Y 154
+static const char *TABN[3] = { "Display", "Mouse", "System" };
+static void set_toggle(int x, int y, int on) {
+    rrect(x, y, 52, 28, 14, on ? ui_acc : 0x3A4650, 256);
+    disc(x + (on ? 38 : 14), y + 14, 10, 0, 0xFFFFFF, 0xFFFFFF, 256);
+}
+static void set_slider(int x, int y, int w, int v, const char *lo, const char *hi) {
+    int i, kx = x + v * w / 4;
+    rrect(x, y, w, 8, 4, 0xFFFFFF, 55);
+    rrect(x, y, kx - x + 2, 8, 4, ui_acc, 256);
+    for (i = 0; i < 5; i++) fill_rect(x + i * w / 4 - 1, y + 14, 2, 8, 0xFFFFFF, 90);
+    disc(kx, y + 4, 15, 0, 0xFFFFFF, 0xFFFFFF, 256);
+    disc(kx, y + 4, 9, 0, ui_acc, ui_acc, 256);
+    draw_text(F_UI, x - 2, y + 46, lo, 0x8E99A2, 230);
+    text_r(F_UI, x + w + 2, y + 46, hi, 0x8E99A2, 230);
+}
+static void set_chip(int x, int y, int w, int h, const char *t, int on) {
+    rrect(x, y, w, h, h / 2, ui_acc, on ? 256 : 70);
+    if (!on) rrect(x + 1, y + 1, w - 2, h - 2, h / 2 - 1, 0x08161C, 235);
+    text_c(F_UI, x + w / 2, y + h / 2 + 8, t, on ? 0x06141A : 0xFFFFFF, 250);
+}
+static void set_field(int x, int y, int w, int h, int editing) {
+    rrect(x, y, w, h, 14, editing ? ui_acc : 0xFFFFFF, editing ? 230 : 60);
+    rrect(x + 1, y + 1, w - 2, h - 2, 13, 0x06121A, 235);
+}
+static void draw_cursor_sample(int x, int y) {          /* the real pointer, at the size currently chosen */
+    int i, j;
+    if (!cur_ready) cursor_build();
+    for (j = 0; j < CUR_H; j++) for (i = 0; i < CUR_W; i++) {
+        u32 a = cur_a[j * CUR_W + i];
+        if (a && x + i < W && y + j < H) { u32 *p = &BACK[(y + j) * W + x + i]; *p = mix(*p, cur_g[j * CUR_W + i] * 0x010101u, a > 256 ? 256 : a); }
+    }
+}
+static void app_settings(void) {
+    int i; char v[16], n[12];
+    for (i = 0; i < 3; i++) set_chip(ax + 24 + i * 150, ay + 54, 138, 36, TABN[i], set_tab == i);
+    if (save_state > 0) text_r(F_UI, ax + AW - 30, ay + 78, "Saved to disk", 0x7CF29C, 230);
+    else if (save_state < 0) text_r(F_UI, ax + AW - 30, ay + 78, "Not saved (no disk)", 0xFF8A80, 230);
+    if (set_tab == 0) {
+        int total = 2 + nwp;
+        draw_text(F_BIG, ax + 40, ay + 140, "Wallpaper", 0xFFFFFF, 250);
+        text_r(F_UI, ax + 740, ay + 138, WPN[wp_choice], ui_acc, 250);
+        for (i = 0; i < total; i++) {
+            int tx = ax + WT_X + (i % 5) * 143, ty = ay + WT_Y + (i / 5) * 88, x, y;
+            rrect(tx - 3, ty - 3, 134, 78, 9, i == wp_choice ? ui_acc : 0xFFFFFF, i == wp_choice ? 256 : 40);
+            for (y = 0; y < TH_; y++) for (x = 0; x < TW_; x++) BACK[(ty + y) * W + tx + x] = THUMBS[i * TW_ * TH_ + y * TW_ + x];
+        }
+        if (!nwp) draw_text(F_UI, ax + 40, ay + 300, "Photo wallpapers: put walls.bin in the project folder and run make.", 0x8E99A2, 230);
+        draw_text(F_BIG, ax + 40, ay + 364, "Accent color", 0xFFFFFF, 250);
+        for (i = 0; i < 6; i++) {
+            int cx = ax + 60 + i * 64, cy = ay + 404;
+            disc(cx, cy, 20, 0, ACC1[i], ACC1[i], 256);
+            if (i == accent) disc(cx, cy, 26, 22, 0xFFFFFF, 0xFFFFFF, 256);
+        }
+        draw_text(F_UI, ax + 40, ay + 482, "24-hour clock", 0xFFFFFF, 245);  set_toggle(ax + 220, ay + 464, clock24);
+        draw_text(F_UI, ax + 380, ay + 482, "Show widgets", 0xFFFFFF, 245); set_toggle(ax + 560, ay + 464, show_w);
+    } else if (set_tab == 1) {
+        u2s(n, (u32)MSP[mspeed] * 5 / 10, 1); v[0] = 0; scat(v, n); scat(v, "."); u2s(n, (u32)MSP[mspeed] * 5 % 10, 1); scat(v, n); scat(v, "x");
+        draw_text(F_BIG, ax + 40, ay + 144, "Mouse speed", 0xFFFFFF, 250);
+        text_r(F_UI, ax + 740, ay + 142, v, ui_acc, 250);
+        set_slider(ax + 40, ay + 170, 700, mspeed, "Slow", "Fast");
+        u2s(n, (u32)CSC[cur_level], 1); v[0] = 0; scat(v, n); scat(v, "%");
+        draw_text(F_BIG, ax + 40, ay + 276, "Cursor size", 0xFFFFFF, 250);
+        text_r(F_UI, ax + 740, ay + 274, v, ui_acc, 250);
+        set_slider(ax + 40, ay + 300, 700, cur_level, "Small", "Big");
+        rrect(ax + 40, ay + 372, 700, 84, 14, 0xFFFFFF, 22);
+        draw_cursor_sample(ax + 370, ay + 386);
+        draw_text(F_UI, ax + 40, ay + 488, "Pointer acceleration", 0xFFFFFF, 245); set_toggle(ax + 300, ay + 470, accel_on);
+    } else {
+        char cpu[64], r[40]; static const char *AN[4] = { "Off", "Fast", "Normal", "Slow" };
+        draw_text(F_UI, ax + 40, ay + 140, "Display name", 0xAEB8BE, 230);
+        set_field(ax + 40, ay + 152, 360, 48, set_edit == 1);
+        draw_text(F_UI, ax + 58, ay + 184, set_edit == 1 ? edbuf : uname, 0xFFFFFF, 250);
+        if (set_edit == 1) { int w = text_w(F_UI, edbuf); fill_rect(ax + 60 + w, ay + 164, 2, 24, 0xFFFFFF, 230); }
+        set_chip(ax + 420, ay + 152, 110, 48, set_edit == 1 ? "Save" : "Edit", set_edit == 1);
+        draw_text(F_UI, ax + 40, ay + 236, "Password", 0xAEB8BE, 230);
+        set_field(ax + 40, ay + 248, 360, 48, set_edit == 2);
+        { const char *pw = set_edit == 2 ? edbuf : upass; int k, len = (int)slen(pw), vis = len > 12 ? 12 : len;
+          for (k = 0; k < vis; k++) diamond(ax + 66 + k * 26, ay + 272, 8, 0xFFFFFF, 256); }
+        set_chip(ax + 420, ay + 248, 110, 48, set_edit == 2 ? "Save" : "Change", set_edit == 2);
+        draw_text(F_UI, ax + 40, ay + 326, set_edit == 2 ? "Type a new password (4+ characters), then Enter" : set_msg, ui_acc, 235);
+        draw_text(F_UI, ax + 40, ay + 372, "Animations", 0xAEB8BE, 230);
+        for (i = 0; i < 4; i++) set_chip(ax + 40 + i * 130, ay + 384, 120, 40, AN[i], anim_lvl == i);
+        rrect(ax + 40, ay + 446, 200, 52, 26, 0xFFFFFF, 70);
+        rrect(ax + 41, ay + 447, 198, 50, 25, 0x08161C, 235);
+        text_c(F_UI, ax + 140, ay + 480, "Lock screen", 0xFFFFFF, 250);
+        cpu_brand(cpu);
+        u2s(n, (u32)W, 1); r[0] = 0; scat(r, n); scat(r, " x "); u2s(n, (u32)H, 1); scat(r, n);
+        text_fit(F_UI, ax + 280, ay + 470, cpu, AW - 280 - 30, 0xAEB8BE, 230);
+        draw_text(F_UI, ax + 280, ay + 500, "Nexora OS v1.0", 0xAEB8BE, 230);
+        text_r(F_UI, ax + AW - 30, ay + 500, r, 0xAEB8BE, 230);
+    }
+}
+static void settings_commit(void) {                     /* Enter pressed in the name / password field */
+    int i;
+    if (set_edit == 1) {
+        if (edn > 0) { for (i = 0; i <= edn; i++) uname[i] = edbuf[i]; set_msg = "Name saved"; st_dirty = 1; }
+        else set_msg = "Name cannot be empty";
+        set_edit = 0;
+    } else if (set_edit == 2) {
+        if (edn >= 4) { for (i = 0; i <= edn; i++) upass[i] = edbuf[i]; set_msg = "Password changed"; st_dirty = 1; set_edit = 0; }
+        else set_msg = "Password needs at least 4 characters";
+    }
+}
+static void settings_click(int rx, int ry) {
+    int i;
+    if (ry >= 54 && ry < 90) { for (i = 0; i < 3; i++) if (rx >= 24 + i * 150 && rx < 24 + i * 150 + 138) { set_tab = i; set_edit = 0; set_msg = ""; dyn_redraw(); } return; }
+    if (set_tab == 0) {
+        if (ry >= WT_Y && ry < WT_Y + 2 * 88 && rx >= WT_X && rx < WT_X + 5 * 143) {
+            int c = (rx - WT_X) / 143, r = (ry - WT_Y) / 88, k = r * 5 + c;
+            if ((rx - WT_X) % 143 < 128 && (ry - WT_Y) % 88 < 72 && k < 2 + nwp && k != wp_choice) { wp_select(k); st_dirty = 1; refresh_all(); }
+        } else if (ry >= 374 && ry < 434) {
+            for (i = 0; i < 6; i++) { int dx = rx - (60 + i * 64), dy = ry - 404; if (dx * dx + dy * dy <= 26 * 26 && i != accent) { accent = i; st_dirty = 1; refresh_all(); } }
+        } else if (inrect(rx, ry, 214, 458, 64, 40)) { clock24 ^= 1; st_dirty = 1; refresh_all(); }
+        else if (inrect(rx, ry, 554, 458, 64, 40)) { show_w ^= 1; st_dirty = 1; refresh_all(); }
+    } else if (set_tab == 1) {
+        if (ry >= 146 && ry < 206 && rx >= 16 && rx <= 764) { int v = ((rx - 40) * 4 + 350) / 700; if (v < 0) v = 0; if (v > 4) v = 4; mspeed = v; st_dirty = 1; dyn_redraw(); }
+        else if (ry >= 276 && ry < 336 && rx >= 16 && rx <= 764) { int v = ((rx - 40) * 4 + 350) / 700; if (v < 0) v = 0; if (v > 4) v = 4; if (v != cur_level) { cur_level = v; st_dirty = 1; cursor_resize(); } dyn_redraw(); }
+        else if (inrect(rx, ry, 294, 464, 64, 40)) { accel_on ^= 1; st_dirty = 1; dyn_redraw(); }
+    } else {
+        if (inrect(rx, ry, 40, 152, 500, 48)) { if (set_edit == 1 && rx >= 420) settings_commit(); else if (set_edit != 1) { set_edit = 1; for (i = 0; uname[i]; i++) edbuf[i] = uname[i]; edbuf[i] = 0; edn = i; set_msg = ""; } dyn_redraw(); }
+        else if (inrect(rx, ry, 40, 248, 500, 48)) { if (set_edit == 2 && rx >= 420) settings_commit(); else if (set_edit != 2) { set_edit = 2; edbuf[0] = 0; edn = 0; set_msg = ""; } dyn_redraw(); }
+        else if (ry >= 384 && ry < 424) { for (i = 0; i < 4; i++) if (rx >= 40 + i * 130 && rx < 160 + i * 130) { anim_lvl = i; st_dirty = 1; dyn_redraw(); } }
+        else if (inrect(rx, ry, 40, 446, 200, 52)) want_lock = 1;
+    }
+}
+static void draw_app(void) {
+    win_frame(ax, ay, AW, AH, APPN[open_app], 256);
+    switch (open_app) {
+    case 0: app_explorer(); break;
+    case 1: app_notepad(); break;
+    case 2: app_calc(); break;
+    case 3: app_terminal(); break;
+    default: app_settings(); break;
+    }
+}
+
+/* ---- composing ---- */
+static void draw_dyn_layers(void) {
+    cv = BACK; ui_dark = 1; ui_acc = ACC1[accent];
+    if (menu_open) draw_menu();
+    draw_logo_btn();
+    draw_taskbar();
+    if (open_app >= 0) draw_app();
+}
+static void restore_desk(int x, int y, int w, int h) {   /* static desktop (SCR) -> BACK region */
+    int x1 = x + w, y1 = y + h, j;
+    if (x < 0) x = 0; if (y < 0) y = 0; if (x1 > W) x1 = W; if (y1 > H) y1 = H;
+    if (x1 <= x) return;
+    for (j = y; j < y1; j++) memcpy(BACK + j * W + x, SCR + j * W + x, (unsigned)(x1 - x) * 4);
+}
+static u32 arow[2048];
+static void overlay_cursor_row(u32 *row, int rx, int y, int w) {        /* keep the pointer visible during animations */
+    int cj = y - (my - 1), i;
+    if (!cur_on || !cur_ready || cj < 0 || cj >= CUR_H) return;
+    for (i = 0; i < w; i++) {
+        int ci = rx + i - (mx - 1);
+        if (ci >= 0 && ci < CUR_W) { u32 al = cur_a[cj * CUR_W + ci]; if (al) row[i] = mix(row[i], cur_g[cj * CUR_W + ci] * 0x010101u, al > 256 ? 256 : al); }
+    }
+}
+/* animate one rectangle from the saved picture `from` (stride w) to the new picture in BACK */
+static void anim_rect(const u32 *from, int rx, int ry, int w, int h, u32 t) {
+    int i, j;
+    for (j = 0; j < h; j++) {
+        const u32 *fa = from + (u32)j * (u32)w, *fb_ = BACK + (u32)(ry + j) * (u32)W + (u32)rx;
+        u32 k = 256 - t;
+        for (i = 0; i < w; i++) { u32 p = fa[i], q = fb_[i]; arow[i] = ((((p & 0xFF00FF) * k + (q & 0xFF00FF) * t) >> 8) & 0xFF00FF) | ((((p & 0x00FF00) * k + (q & 0x00FF00) * t) >> 8) & 0x00FF00); }
+        overlay_cursor_row(arow, rx, ry + j, w);
+        put_row(ry + j, rx, arow, w);
+    }
+}
+static void dyn_redraw_ex(int anim_app, int anim_menu) {
+    int mx_, my_, mw_, mh_, lx, ly, lw, lh, tx, ty, tw, th, ar_x = 0, ar_y = 0, ar_w = AW, ar_h = AH;
+    u32 *sv_app = TMP, *sv_menu = TMP + 500000, dur = 170u * ANM[anim_lvl] / 100; int j;
+    if (!dur) { anim_app = 0; anim_menu = 0; }
+    menu_rect(&mx_, &my_, &mw_, &mh_); lb_rect(&lx, &ly, &lw, &lh); tb_rect(&tx, &ty, &tw, &th);
+    mx_ -= 4; my_ -= 4; mw_ += 8; mh_ += 8;
+    if (anim_app) {                                  /* remember how the window area looks now */
+        if (open_app >= 0) { ar_x = ax; ar_y = ay; } else if (dr_w) { ar_x = dr_x; ar_y = dr_y; } else anim_app = 0;
+        if (ar_x < 0 || ar_y < 0 || ar_x + ar_w > W || ar_y + ar_h > H) anim_app = 0;
+    }
+    if (anim_menu && (mx_ < 0 || my_ < 0 || mx_ + mw_ > W || my_ + mh_ > H)) anim_menu = 0;
+    if (anim_app)  for (j = 0; j < ar_h; j++) memcpy(sv_app + (u32)j * (u32)ar_w, BACK + (u32)(ar_y + j) * (u32)W + (u32)ar_x, (unsigned)ar_w * 4);
+    if (anim_menu) for (j = 0; j < mh_; j++) memcpy(sv_menu + (u32)j * (u32)mw_, BACK + (u32)(my_ + j) * (u32)W + (u32)mx_, (unsigned)mw_ * 4);
+    restore_desk(mx_, my_, mw_, mh_);
+    restore_desk(lx, ly, lw, lh);
+    restore_desk(tx - 4, ty - 4, tw + 8, th + 8);
+    if (dr_w) restore_desk(dr_x, dr_y, dr_w, AH);
+    if (open_app >= 0) restore_desk(ax, ay, AW, AH);
+    draw_dyn_layers();
+    if (!anim_menu) present(mx_, my_, mw_, mh_);
+    present(lx, ly, lw, lh);
+    present(tx - 4, ty - 4, tw + 8, th + 8);
+    if (dr_w && !anim_app) present(dr_x, dr_y, dr_w, AH);
+    if (open_app >= 0 && !anim_app) present(ax, ay, AW, AH);
+    if (anim_app || anim_menu) {                     /* ease-out fade, about 170 ms */
+        u32 t0 = ms_now(), e;
+        while ((e = ms_now() - t0) < dur) {
+            u32 f0 = ms_now(), u = 256 - e * 256 / dur, t;
+            t = 256 - ((u * u) >> 8);
+            if (anim_app)  anim_rect(sv_app, ar_x, ar_y, ar_w, ar_h, t);
+            if (anim_menu) anim_rect(sv_menu, mx_, my_, mw_, mh_, t);
+            frame_wait(f0, 8);
+        }
+        if (anim_app)  present(ar_x, ar_y, ar_w, ar_h);
+        if (anim_menu) present(mx_, my_, mw_, mh_);
+    }
+    if (open_app >= 0) { dr_x = ax; dr_y = ay; dr_w = AW; } else dr_w = 0;
+    cursor_draw();
+}
+static void dyn_redraw(void) { dyn_redraw_ex(0, 0); }
+/* redraw only some layers (1 menu, 2 logo button, 4 taskbar, 8 app window). Layers that overlap a redrawn one are redrawn too. */
+static void layer_rect(int L, int *x, int *y, int *w, int *h) {
+    switch (L) {
+    case 0: menu_rect(x, y, w, h); *x -= 4; *y -= 4; *w += 8; *h += 8; break;
+    case 1: lb_rect(x, y, w, h); break;
+    case 2: tb_rect(x, y, w, h); *x -= 4; *y -= 4; *w += 8; *h += 8; break;
+    default: *x = ax; *y = ay; *w = AW; *h = AH; break;
+    }
+}
+static int rect_hit(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2) { return x1 < x2 + w2 && x2 < x1 + w1 && y1 < y2 + h2 && y2 < y1 + h1; }
+static int layer_on(int L) { return L == 0 ? menu_open : L == 3 ? open_app >= 0 : 1; }
+static void dyn_redraw_part(int parts) {
+    int dirty = parts & 7, L, M, changed = 1, x, y, w, h, x2, y2, w2, h2;
+    if ((parts & 8) && open_app >= 0) dirty |= 8;
+    if ((parts & 8) && dr_w) {                       /* the window moved: whatever was under its old place must be redrawn too */
+        for (M = 0; M < 4; M++) { layer_rect(M, &x, &y, &w, &h); if (layer_on(M) && rect_hit(dr_x, dr_y, AW, AH, x, y, w, h)) dirty |= 1 << M; }
+    }
+    while (changed) {
+        changed = 0;
+        for (L = 0; L < 4; L++) if (dirty & (1 << L)) {
+            layer_rect(L, &x, &y, &w, &h);
+            for (M = 0; M < 4; M++) if (!(dirty & (1 << M)) && layer_on(M)) {
+                layer_rect(M, &x2, &y2, &w2, &h2);
+                if (rect_hit(x, y, w, h, x2, y2, w2, h2)) { dirty |= 1 << M; changed = 1; }
+            }
+        }
+    }
+    cv = BACK; ui_dark = 1; ui_acc = ACC1[accent];
+    if ((parts & 8) && dr_w) restore_desk(dr_x, dr_y, dr_w, AH);
+    for (L = 0; L < 4; L++) if (dirty & (1 << L)) { layer_rect(L, &x, &y, &w, &h); restore_desk(x, y, w, h); }
+    if ((dirty & 1) && menu_open) draw_menu();
+    if (dirty & 2) draw_logo_btn();
+    if (dirty & 4) draw_taskbar();
+    if ((dirty & 8) && open_app >= 0) draw_app();
+    if ((parts & 8) && dr_w) present(dr_x, dr_y, dr_w, AH);
+    for (L = 0; L < 4; L++) if (dirty & (1 << L)) { layer_rect(L, &x, &y, &w, &h); present(x, y, w, h); }
+    if (open_app >= 0) { dr_x = ax; dr_y = ay; dr_w = AW; } else dr_w = 0;
+    cursor_draw();
+}
+static void scene_full(void) {
+    memcpy(BACK, SCR, (unsigned)W * H * 4);
+    draw_dyn_layers();
+    present(0, 0, W, H);
+    if (open_app >= 0) { dr_x = ax; dr_y = ay; dr_w = AW; } else dr_w = 0;
+    cursor_draw();
+}
+static void refresh_all(void) { build_desk(); memcpy(SCR, BACK, (unsigned)W * H * 4); scene_full(); }
+
+/* ---- actions ---- */
+static void launch(int i) {
+    if (open_app < 0) { ax = (W - AW) / 2; ay = 110; }
+    { int mo = menu_open; open_app = i; menu_open = 0; sfocus = 0; sn = 0; sbuf[0] = 0; dyn_redraw_ex(1, mo); }
+}
+static void show_desktop(void) { int mo = menu_open; open_app = -1; menu_open = 0; sfocus = 0; dyn_redraw_ex(1, mo); }
+static int search_match(void) {
+    int i, k;
+    if (!sn) return -1;
+    for (i = 0; i < NAPPS; i++) { k = 0; while (k < sn && lc(APPN[i][k]) == lc(sbuf[k])) k++; if (k == sn) return i; }
+    for (i = 0; i < NAPPS; i++) { const char *a = APPN[i]; int s; for (s = 0; a[s]; s++) { k = 0; while (k < sn && a[s + k] && lc(a[s + k]) == lc(sbuf[k])) k++; if (k == sn) return i; } }
+    if (sn >= 4 && lc(sbuf[0]) == 'f' && lc(sbuf[1]) == 'i' && lc(sbuf[2]) == 'l' && lc(sbuf[3]) == 'e') return 0;
+    return -1;
+}
+static void app_click(int rx, int ry) {
+    if (open_app == 2) {
+        int gx = (AW - (4 * CBW + 3 * CBG)) / 2, gy = 150, c = (rx - gx) / (CBW + CBG), r = (ry - gy) / (CBH + CBG);
+        if (rx >= gx && ry >= gy && c < 4 && r < 4 && (rx - gx) % (CBW + CBG) < CBW && (ry - gy) % (CBH + CBG) < CBH) { calc_key(CB[r][c]); dyn_redraw(); }
+    } else if (open_app == 4) {
+        settings_click(rx, ry);
+    }
+}
+static void desk_click(int px, int py) {
+    int i, cx, cy, r;
+    if (open_app >= 0 && inrect(px, py, ax, ay, AW, AH)) {
+        sfocus = 0;
+        if (py < ay + 44) {
+            if (px >= ax + AW - 40) { open_app = -1; dyn_redraw_ex(1, 0); }
+            else if (px >= ax + AW - 72) { }
+            else if (px >= ax + AW - 104) { open_app = -1; dyn_redraw_ex(1, 0); }
+            else { drag = 1; dgx = px - ax; dgy = py - ay; }
+        } else app_click(px - ax, py - ay);
+        return;
+    }
+    i = tb_hit(px, py);
+    if (i >= 0) {
+        if (i < NAPPS) launch(i);
+        else if (i == 5) show_desktop();
+        else if (i == 6) { sfocus = 1; menu_open = 0; dyn_redraw(); }
+        else if (i == 8) { show_w ^= 1; st_dirty = 1; refresh_all(); }
+        else if (i == 9) { clock24 ^= 1; st_dirty = 1; refresh_all(); }
+        else if (i == 10 || i == 11) {
+            int sx, sy, v; tb_sld(i - 10, &sx, &sy);
+            v = ((px - sx) * 4 + 49) / 98; if (px < sx) v = 0; if (v > 4) v = 4;
+            st_dirty = 1;
+            if (i == 10) { mspeed = v; dyn_redraw(); } else { glass_lvl = v; refresh_all(); }
+        }
+        return;
+    }
+    lb_geom(&cx, &cy, &r);
+    if ((px - cx) * (px - cx) + (py - cy) * (py - cy) <= r * r) { menu_open ^= 1; sfocus = 0; dyn_redraw_ex(0, 1); return; }
+    if (menu_open) {
+        int x, y, w, h; menu_rect(&x, &y, &w, &h);
+        for (i = 0; i < NAPPS; i++) if (inrect(px, py, x + 8, y + 12 + i * 64, w - 16, 56)) { launch(i); return; }
+        menu_open = 0; sfocus = 0; dyn_redraw_ex(0, 1); return;
+    }
+    if (sfocus) { sfocus = 0; dyn_redraw(); }
+}
+static int pend;                                    /* a redraw is waiting (hover / drag) */
+static u32 ldm;
+static int pend_parts, hov_calc = -1;
+static void on_move(void) {
+    int nm = -1, nt = tb_hit(mx, my), i, parts = 0;
+    if (menu_open) { int x, y, w, h; menu_rect(&x, &y, &w, &h); for (i = 0; i < NAPPS; i++) if (inrect(mx, my, x + 8, y + 12 + i * 64, w - 16, 56)) nm = i; }
+    if (open_app >= 0 && inrect(mx, my, ax, ay, AW, AH)) { nm = -1; nt = -1; }
+    if (nm != hov_menu) { hov_menu = nm; parts |= 1; }
+    if (nt != hov_tb)   { hov_tb = nt;   parts |= 4; }
+    if (drag) {
+        int nx = mx - dgx, ny = my - dgy;
+        if (nx < 0) nx = 0; if (nx > W - AW) nx = W - AW; if (ny < 52) ny = 52; if (ny > H - AH - 8) ny = H - AH - 8;
+        if (nx != ax || ny != ay) { ax = nx; ay = ny; parts |= 8; }
+    }
+    {   /* calculator: only redraw when the button under the pointer changes */
+        int nc = -1;
+        if (open_app == 2 && inrect(mx, my, ax, ay, AW, AH)) {
+            int gx = ax + (AW - (4 * CBW + 3 * CBG)) / 2, gy = ay + 150, c = (mx - gx) / (CBW + CBG), r = (my - gy) / (CBH + CBG);
+            if (mx >= gx && my >= gy && c < 4 && r < 4 && (mx - gx) % (CBW + CBG) < CBW && (my - gy) % (CBH + CBG) < CBH) nc = r * 4 + c;
+        }
+        if (nc != hov_calc) { hov_calc = nc; if (open_app == 2) parts |= 8; }
+    }
+    if (parts) { pend = 1; pend_parts |= parts; }
+}
+/* returns 1 when the user asked to lock the screen */
+static int desk_key(int c) {
+    if (open_app == 4 && set_edit) {                 /* typing in Settings (name / password) */
+        if (c == 27) { set_edit = 0; set_msg = ""; }
+        else if (c == 10) settings_commit();
+        else if (c == 8) { if (edn) edbuf[--edn] = 0; }
+        else if (c >= 32 && c < 127 && edn < 20) { edbuf[edn++] = (char)c; edbuf[edn] = 0; }
+        dyn_redraw(); return 0;
+    }
+    if (c == 27) {
+        { int aa = 0, am = 0;
+          if (sfocus) { sfocus = 0; sn = 0; sbuf[0] = 0; }
+          else if (open_app >= 0) { open_app = -1; aa = 1; }
+          else if (menu_open) { menu_open = 0; am = 1; }
+          dyn_redraw_ex(aa, am); }
+        return 0;
+    }
+    if (sfocus) {
+        if (c == 10) { int m = search_match(); if (m >= 0) { launch(m); return 0; } }
+        else if (c == 8) { if (sn) sbuf[--sn] = 0; }
+        else if (c >= 32 && c < 127 && sn < 22) { sbuf[sn++] = (char)c; sbuf[sn] = 0; }
+        dyn_redraw(); return 0;
+    }
+    if (open_app == 1) {
+        if (c == 8) { if (nplen) nplen--; }
+        else if (c == 10 || (c >= 32 && c < 127)) { if (nplen < (int)sizeof(npbuf) - 1) npbuf[nplen++] = (char)c; }
+        else return 0;
+        dyn_redraw(); return 0;
+    }
+    if (open_app == 3) {
+        if (c == 10) term_exec();
+        else if (c == 8) { if (tinn) tin[--tinn] = 0; }
+        else if (c >= 32 && c < 127 && tinn < 60) { tin[tinn++] = (char)c; tin[tinn] = 0; }
+        else return 0;
+        if (want_lock) return 1;
+        dyn_redraw(); return 0;
+    }
+    if (open_app == 2) {
+        if (c >= '0' && c <= '9') calc_key(c);
+        else if (c == '+' || c == '-' || c == '*' || c == '/') calc_key(c);
+        else if (c == 10 || c == '=') calc_key('=');
+        else if (c == 'c' || c == 'C') calc_key('C');
+        else if (c == 8) calc_key('<');
+        else return 0;
+        dyn_redraw(); return 0;
+    }
+    if (c == 'l' || c == 'L') return 1;
+    if (c == 9 || c == '/') { sfocus = 1; menu_open = 0; dyn_redraw(); }
+    return 0;
+}
+
+static void desktop_screen(void) {
+    u32 tc = 0; int lastm = -1, k;
+    memcpy(SCR, BACK, (unsigned)W * H * 4);                  /* old frame for the crossfade */
+    WALL = wp_wall();
+    open_app = -1; menu_open = 1; sfocus = 0; drag = 0; sn = 0; sbuf[0] = 0; dr_w = 0; hov_menu = hov_tb = -1; want_lock = 0;
+    if (!tln) term_init();
+    build_desk(); draw_dyn_layers();
+    crossfade(380);
+    refresh_all();                                           /* SCR = clean desktop, then draw layers */
+    kb_shift = 0; kb_ext = 0; cur_on = 0; mouse_reset();
+    mx = W / 2; my = H / 2; cursor_draw();
+    SNAP("desk0");
+    for (;;) {
+        mouse_drain();                                       /* take ALL waiting mouse bytes first */
+        for (k = 0; k < 6; k++) {
+            int c = key_char();
+            if (c) { if (desk_key(c)) return; break; }
+        }
+        if (want_lock) { want_lock = 0; return; }
+        if (drag && !(mbtn & 1)) drag = 0;
+        if (mx != cur_x || my != cur_y) { on_move(); cursor_update(); }
+        if (mclick) { mclick = 0; desk_click(mx, my); SNAP("click"); }
+        if (st_dirty && !(mbtn & 1)) { st_dirty = 0; settings_save(); }
+        if (pend && ms_now() - ldm >= 16) { int p = pend_parts; pend = 0; pend_parts = 0; ldm = ms_now(); dyn_redraw_part(p); }   /* only the part that changed */
+        if (want_lock) { want_lock = 0; return; }
+        if (ms_now() - tc > 400) {
+            struct tm_ t; tc = ms_now(); rtc_time(&t);
+            if (lastm >= 0 && t.m != lastm) refresh_all();
+            lastm = t.m;
+        }
+        plat_wait(1);
     }
 }
 
@@ -966,7 +2104,6 @@ void kmain(void) {
     boot_sequence();
     for (;;) {
         lock_screen();
-        loading_screen();
         desktop_screen();
     }
 }

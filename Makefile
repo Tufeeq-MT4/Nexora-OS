@@ -26,15 +26,28 @@ boot.bin: boot.S kernel.bin
 	objcopy -O binary boot.elf boot.bin
 
 os.img: boot.bin kernel.bin
+	@if [ -f os.img ]; then dd if=os.img of=.settings.sec bs=512 skip=2800 count=1 status=none 2>/dev/null || true; fi
 	dd if=/dev/zero of=os.img bs=512 count=2880 status=none
 	dd if=boot.bin of=os.img conv=notrunc status=none
 	dd if=kernel.bin of=os.img bs=512 seek=4 conv=notrunc status=none
+	@if [ -f walls.bin ]; then \
+	  dd if=walls.bin of=os.img bs=512 seek=4096 conv=notrunc status=none; \
+	  echo "OK: wallpapers added from walls.bin"; \
+	else echo "NOTE: walls.bin not found - photo wallpapers skipped"; fi
+	@if [ -s .settings.sec ]; then dd if=.settings.sec of=os.img bs=512 seek=2800 conv=notrunc status=none; echo "OK: your saved settings were kept"; fi
 	@echo "OK: os.img ready"
 
 run: os.img
-	qemu-system-i386 -m 128 -drive file=os.img,format=raw -vga std -rtc base=localtime -display gtk,zoom-to-fit=on
+	# accel=kvm:tcg = use the CPU hardware (fast, smooth) when /dev/kvm exists, otherwise fall back to slow software mode
+	qemu-system-i386 -machine pc,accel=kvm:tcg -m 128 -drive file=os.img,format=raw -vga std -rtc base=localtime -display gtk,zoom-to-fit=on
 
 clean:
+	@if [ -f os.img ]; then dd if=os.img of=.settings.sec bs=512 skip=2800 count=1 status=none 2>/dev/null || true; fi
 	rm -f *.o *.elf boot.bin kernel.bin os.img
 
-.PHONY: all run clean
+# erase the saved settings too (password goes back to 11223344)
+reset-settings:
+	rm -f .settings.sec os.img
+	@echo "Settings erased. Run: make run"
+
+.PHONY: all run clean reset-settings
